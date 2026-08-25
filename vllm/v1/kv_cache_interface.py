@@ -77,6 +77,13 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
         return KVQuantMode.TURBOQUANT
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_"):
+        # KVarN reuses TQ's packed per-slot layout (TQFullAttentionSpec /
+        # TQSlidingWindowSpec), so it maps to the same mode. Keeping this
+        # non-NONE also stops the runner's skip-layers dtype resolution from
+        # treating kvarn layers as unquantized and passing "auto" to
+        # get_kv_cache_shape.
+        return KVQuantMode.TURBOQUANT
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
