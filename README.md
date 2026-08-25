@@ -1,4 +1,4 @@
-[![Built on vLLM](https://img.shields.io/badge/Built%20on-vLLM%20v0.23.0-30a14e)](https://github.com/vllm-project/vllm)
+[![Built on vLLM](https://img.shields.io/badge/Built%20on-vLLM%20v0.27.1-30a14e)](https://github.com/vllm-project/vllm)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![arXiv](https://img.shields.io/badge/arXiv-2606.03458-b31b1b.svg)](https://arxiv.org/abs/2606.03458)
 [![hf-space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Huawei%20CSL-ffc107?color=ffc107&logoColor=white)](https://huggingface.co/huawei-csl)
@@ -237,6 +237,6 @@ If you use KVarN, please cite:
 
 ## License and attribution
 
-KVarN is built on [vLLM](https://github.com/vllm-project/vllm) (v0.23.0) and is
+KVarN is built on [vLLM](https://github.com/vllm-project/vllm) (v0.27.1) and is
 released under the Apache 2.0 License. The original vLLM README is preserved as
 [`README_vLLM.md`](README_vLLM.md).
