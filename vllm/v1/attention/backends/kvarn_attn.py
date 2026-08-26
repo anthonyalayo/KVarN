@@ -382,6 +382,27 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         except Exception:
             self._group = 128
 
+        # Tile units: the KVarN kernels index the block table in TILES
+        # (GROUP tokens each), but vLLM allocates the unified attention block
+        # (kv_cache_spec.block_size), which hybrid models inflate above the
+        # tile size (e.g. 3200 = 25 tiles). The builder expands the vLLM-block
+        # table to tile rows once in build(); pool slots, sinks, fill counts
+        # and flushes are keyed by tile row end to end.
+        bs = self.kv_cache_spec.block_size
+        assert bs % self._group == 0, (
+            "KVarN hybrid inflation must produce a block size divisible by "
+            f"the tile size (block_size={bs}, group={self._group})."
+        )
+        self._tpr = bs // self._group  # tiles per vLLM block (1 = non-hybrid)
+        self._max_tiles = (self._max_model_len + self._group - 1) // self._group
+        try:
+            self._max_num_seqs_hint = vllm_config.scheduler_config.max_num_seqs
+        except Exception:
+            self._max_num_seqs_hint = 256
+        # Persistent tile-unit block table (allocated lazily in build()).
+        self._tile_bt_buf: torch.Tensor | None = None
+        self._tile_bt_host: torch.Tensor | None = None
+
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor | None = None
         self._cu_seqlens_k_buf: torch.Tensor | None = None
@@ -392,6 +413,38 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._vq_seqlen_buf: torch.Tensor | None = None
         self._vq_req_host: torch.Tensor | None = None
         self._vq_seqlen_host: torch.Tensor | None = None
+
+    @staticmethod
+    def _tile_row_table(block_table_np, seq_lens_cpu, tpr, group, max_tiles):
+        """Expand a vLLM-block block table to per-tile rows (int32).
+
+        ``block_table_np[b, vb]`` is the physical vLLM block (``tpr * group``
+        tokens) of request ``b``'s vLLM block ``vb``; the kernels want one row
+        per KVarN tile (``group`` tokens) — tile ``t`` lives in vLLM block
+        ``t // tpr`` at offset ``t % tpr``. Entries at or past the request's
+        length, and entries whose vLLM block is unallocated (-1 padding),
+        stay -1, matching the block-table convention the kernels honour.
+        Pure CPU/numpy: unit-testable without torch, GPU, or a model.
+        """
+        import numpy as np
+        B = len(seq_lens_cpu)
+        out = np.full((B, max_tiles), -1, dtype=np.int32)
+        bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
+        for b, sl in enumerate(seq_lens_cpu):
+            n_tiles = (int(sl) + group - 1) // group
+            if n_tiles <= 0 or bt_cols == 0:
+                continue
+            if n_tiles > max_tiles:
+                n_tiles = max_tiles
+            row = block_table_np[b]
+            for t in range(n_tiles):
+                vb = t // tpr
+                if vb >= bt_cols:
+                    break  # beyond the table width; later tiles are too
+                vbid = int(row[vb])
+                if vbid >= 0:
+                    out[b, t] = vbid * tpr + t % tpr
+        return out
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -432,6 +485,26 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         bt_rows = block_table_np.shape[0]
         bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
         device = cam.seq_lens.device
+        # Tile-unit block table for the kernels: expand the vLLM-block table
+        # (bt_cols cols of tpr tiles each) to one physical tile row per
+        # GROUP-token tile. The kernels, pool slots, sinks, fill counts and
+        # flushes all work in tile rows; this is the only place both unit
+        # systems meet. PERSISTENT buffers updated in place (mirroring the
+        # cu_seqlens buffers) so captured graphs see fresh values.
+        tile_bt_np = self._tile_row_table(
+            block_table_np, seq_lens_cpu, self._tpr, self._group,
+            self._max_tiles)
+        bt_rows_cap = len(seq_lens_cpu)
+        if (self._tile_bt_buf is None
+                or self._tile_bt_buf.shape[0] < bt_rows_cap):
+            new_cap = max(bt_rows_cap, self._max_num_seqs_hint, 8)
+            self._tile_bt_buf = torch.empty(
+                new_cap, self._max_tiles, dtype=torch.int32, device=device)
+            self._tile_bt_host = torch.empty(
+                new_cap, self._max_tiles, dtype=torch.int32, pin_memory=True)
+        self._tile_bt_host[:bt_rows_cap].copy_(torch.from_numpy(tile_bt_np))
+        self._tile_bt_buf[:bt_rows_cap].copy_(
+            self._tile_bt_host[:bt_rows_cap], non_blocking=True)
 
         # ── Stage α-2: capture-correct metadata ──────────────────────────
         # The decode driver uses ONE block_table-driven kernel that reads the
@@ -441,7 +514,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # cu_seqlens_q (= arange(B+1)), both kept in PERSISTENT buffers and
         # updated in place so captured graphs see fresh values.
         B = len(seq_lens_cpu)
-        GROUP = self._group                            # KVarN tile size (= block size); 64 or 128
+        GROUP = self._group                            # KVarN tile size (GROUP tokens); 64 or 128
         cu_seqlens_k_h = [0]
         for sl in seq_lens_cpu:
             cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
@@ -451,11 +524,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # and we mutate it here (in the builder, outside any captured
         # region). do_kv_cache_update then only READS block_to_slot_t.
         from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl  # local import
-        # Pool slots are needed ONLY for blocks that physically live in the fp16
-        # tail pool: each request's sink (block_table[r][0], kept fp16 for the
-        # request's lifetime) and the blocks receiving writes THIS step —
+        # Pool slots are needed ONLY for tiles that physically live in the fp16
+        # tail pool: each request's sink (its first tile, kept fp16 for the
+        # request's lifetime) and the tiles receiving writes THIS step —
         # tokens committed..seq_len-1 land in do_kv_cache_update after the
-        # builder. Flushed history blocks live in the int4 cache, carry
+        # builder. Flushed history tiles live in the int4 cache, carry
         # pool_slot=-1, and are dequantized in-kernel.
         #
         # Sharing-safe lifecycle (prefix caching + chunked prefill + spec
@@ -480,15 +553,19 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             row = block_table_np[b]
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
             committed = max(sl - q_len, 0)
-            # Blocks written this step. Record how full each will be AFTER the
-            # step: if its owner finishes on the step that fills it, the
-            # reclaim below must flush it (not discard).
-            for k in range(committed // GROUP,
-                           min((sl - 1) // GROUP, bt_cols - 1) + 1):
-                bid = int(row[k])
-                if bid >= 0:
-                    blocks_needed.add(bid)
-                    self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
+            # Tiles written this step (one tile = GROUP tokens; tile t lives in
+            # vLLM block t // tpr at offset t % tpr). Record how full each
+            # will be AFTER the step: if its owner finishes on the step that
+            # fills it, the reclaim below must flush it (not discard).
+            for t in range(committed // GROUP,
+                           min((sl + GROUP - 1) // GROUP,
+                               bt_cols * self._tpr)):
+                vbid = int(row[t // self._tpr])
+                if vbid < 0:
+                    continue
+                tr = vbid * self._tpr + t % self._tpr
+                blocks_needed.add(tr)
+                self._block_fill[tr] = min(sl, (t + 1) * GROUP) - t * GROUP
         for s in slot_mapping_cpu:                 # safety superset of the above
             if s >= 0:
                 blocks_needed.add(s // GROUP)
@@ -513,32 +590,35 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             free_slots = KVarNAttentionImpl._free_slots[gk]
             sinks = KVarNAttentionImpl._global_sink_blocks[gk]
 
-            # ORDER MATTERS: mark sinks → FLUSH (frees just-completed blocks'
+            # ORDER MATTERS: mark sinks → FLUSH (frees just-completed tiles'
             # slots) → ALLOCATE (the new tails, reusing the freed slots). Doing
             # the flush before allocation caps the live-slot peak at 2·B
             # (one sink + one in-progress tail per request). Allocating first
-            # would transiently need 3·B when every request crosses a block
-            # boundary in lockstep (sink + pending-flush full block + new tail)
+            # would transiently need 3·B when every request crosses a tile
+            # boundary in lockstep (sink + pending-flush full tile + new tail)
             # → "pool exhausted" at large batch.
 
-            # (1) Mark per-request sink blocks (block_table[r][0]). A block is
-            # an fp16 sink only while its data lives in the pool: a fresh
-            # prefill writes block 0 this step (it is in blocks_needed) and
+            # (1) Mark per-request sink tiles — the request's FIRST TILE (tile
+            # 0 of vLLM block 0; tile rows, not vLLM block ids). A tile is an
+            # fp16 sink only while its data lives in the pool: a fresh
+            # prefill writes tile 0 this step (it is in blocks_needed) and
             # keeps it fp16 for the request's lifetime; an existing sink keeps
             # its slot via blocks_needed. A prefix-cache-hit request whose
-            # block 0 was already reclaimed (flushed to int4) must NOT re-mark
-            # it: its data lives in the int4 tile (slot -1) and every kernel
-            # reads it there like any history block. Re-marking would allocate
-            # an EMPTY pool slot that is never written (cache hits skip those
-            # tokens) and attention would read garbage for the whole first
-            # block — the issue #10 repetition-loops on multi-turn chat.
+            # first tile was already reclaimed (flushed to int4) must NOT
+            # re-mark it: its data lives in the int4 tile (slot -1) and every
+            # kernel reads it there like any history tile. Re-marking would
+            # allocate an EMPTY pool slot that is never written (cache hits
+            # skip those tokens) and attention would read garbage for the
+            # whole first tile — the issue #10 repetition-loops on
+            # multi-turn chat.
             row0_set: set[int] = set()
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
-                s0 = int(block_table_np[b, 0])
-                if s0 < 0:
+                s0v = int(block_table_np[b, 0])
+                if s0v < 0:
                     continue
+                s0 = s0v * self._tpr
                 row0_set.add(s0)
                 if s0 in sinks:
                     blocks_needed.add(s0)          # live/retired sink keeps its slot
@@ -561,8 +641,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                         is_sink_t[bid] = False
 
             # (2) Flush detection (Stage α-2 Step B).
-            # CRITICAL timing: token (k+1)*GROUP-1 (the one that completes
-            # block k) is written during THIS step's do_kv_cache_update, which
+            # CRITICAL timing: token (t+1)*GROUP-1 (the one that completes
+            # tile t) is written during THIS step's do_kv_cache_update, which
             # runs AFTER the builder. So at builder time the pool only holds
             # tokens already committed before this step. That committed count is
             # `seq_len - query_len` (this step's query tokens are written later),
@@ -573,20 +653,21 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # speculative decoding (MTP / draft) a step appends `num_spec+1`
             # tokens at once and seq_len jumps by a VARIABLE accepted amount,
             # with later-rejected speculative tokens sitting in the pool until
-            # they are overwritten next step. Quantizing a block to int4 is
-            # PERMANENT, so flushing a block that still contains a speculative
+            # they are overwritten next step. Quantizing a tile to int4 is
+            # PERMANENT, so flushing a tile that still contains a speculative
             # (rejectable) token freezes wrong KV → progressive corruption →
             # repetition-collapse / garbage. Using the committed length means we
-            # only ever quantize blocks whose tokens are all accepted.
+            # only ever quantize tiles whose tokens are all accepted.
             #
-            # Walk each row BACKWARD from the committed boundary while blocks
-            # still hold pool slots — those are exactly the full-but-unflushed
-            # blocks. The walk stops at the first slotless block (flushes
-            # happen in order, so everything earlier is already int4) and never
-            # touches k=0 (a live request's sink stays fp16; finished requests'
-            # sinks are handled by the reclaim below). Idempotent under prefix
-            # sharing: a co-owner finds the block already queued (or slotless)
-            # and stops — no per-request state to collide.
+            # Walk each row BACKWARD (in tile order) from the committed
+            # boundary while tiles still hold pool slots — those are exactly
+            # the full-but-unflushed tiles. The walk stops at the first
+            # slotless tile (flushes happen in order, so everything earlier is
+            # already int4) and never touches tile 0 (a live request's sink
+            # stays fp16; finished requests' sinks are handled by the reclaim
+            # below). Idempotent under prefix sharing: a co-owner finds the
+            # tile already queued (or slotless) and stops — no per-request
+            # state to collide.
             flush_block_ids: list[int] = []
             flush_seen: set[int] = set()
             for b in range(B):
@@ -598,25 +679,28 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     continue
                 q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
                 committed_len = max(sl - q_len, 0)    # tokens already in pool & accepted
-                k = min(committed_len // GROUP - 1, bt_cols - 1)
-                while 1 <= k:
-                    bid = int(row[k])
-                    if (bid < 0 or bid in flush_seen or bid in sinks
-                            or bid not in dict_map):
+                t = committed_len // GROUP - 1
+                while t >= 1:
+                    vbid = int(row[t // self._tpr])
+                    if vbid < 0:
                         break
-                    flush_seen.add(bid)
-                    flush_block_ids.append(bid)
-                    k -= 1
+                    tr = vbid * self._tpr + t % self._tpr
+                    if (tr in flush_seen or tr in sinks
+                            or tr not in dict_map):
+                        break
+                    flush_seen.add(tr)
+                    flush_block_ids.append(tr)
+                    t -= 1
 
-            # (2b) Reclaim slot-holding blocks neither written this step nor
+            # (2b) Reclaim slot-holding tiles neither written this step nor
             # queued above: they belong to finished (or preempted) requests.
             # A COMPLETE sink is RETIRED — kept fp16-resident so a prefix-
             # cache hit (every follow-up chat turn) re-adopts it byte-
             # identically; the old discard destroyed its fp16-only data
             # outright, garbling every multi-turn cache hit (issue #10 loops).
-            # Any other COMPLETE block is FLUSHED — vLLM's prefix cache may
+            # Any other COMPLETE tile is FLUSHED — vLLM's prefix cache may
             # hand it to a future request, which must find a valid int4 tile
-            # (the old discard left stale tile bytes). A PARTIAL block is
+            # (the old discard left stale tile bytes). A PARTIAL tile is
             # discarded: vLLM never prefix-caches partial blocks.
             discard_ids: list[int] = []
             for bid in [b for b in dict_map
@@ -791,7 +875,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         return KVarNMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
-            block_table=cam.block_table_tensor,
+            block_table=self._tile_bt_buf[:B],
             query_start_loc=cam.query_start_loc,
             num_actual_tokens=cam.num_actual_tokens,
             max_query_len=cam.max_query_len,
@@ -815,17 +899,17 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-block fp16 tail buffer (in-progress tile staging)
+# Per-tile fp16 tail buffer (in-progress tile staging)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
 class _BlockTail:
-    """In-progress fp16 K/V for one cache block.
+    """In-progress fp16 K/V for one tile (GROUP tokens), keyed by tile row.
 
-    Reset whenever a token with ``position_in_block == 0`` arrives for this
-    block_id (handles vLLM's block recycling on request preemption). Evicted
-    immediately after a 128-token flush.
+    Reset whenever a token at position 0 of the tile arrives for this
+    tile row (handles vLLM's block recycling on request preemption). Evicted
+    immediately after a full-tile flush.
     """
 
     K: torch.Tensor  # [group, num_kv_heads, head_dim] fp16
