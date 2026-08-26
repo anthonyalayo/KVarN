@@ -677,7 +677,6 @@ class Platform:
         """
         from vllm.config.vllm import set_current_vllm_config
         from vllm.utils.math_utils import cdiv
-        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
         from vllm.v1.attention.backend import MultipleOf
         from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
@@ -687,29 +686,27 @@ class Platform:
         if not model_config:
             return
 
-        def per_token_page_bytes(dtype: "torch.dtype", cache_dtype: str) -> int:
+        def per_token_page_bytes(dtype: "torch.dtype") -> int:
             """Bytes one token occupies in one layer, for the given dtype."""
             return FullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=dtype,
-                kv_quant_mode=get_kv_quant_mode(cache_dtype),
+                kv_quant_mode=get_kv_quant_mode("auto"),
             ).page_size_bytes
 
-        primary_dtype = (
-            STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-            if cache_config.cache_dtype != "auto"
-            else model_config.dtype
-        )
-        primary_page = per_token_page_bytes(primary_dtype, cache_config.cache_dtype)
+        # The primary's per-token page must use the backend's real (possibly
+        # packed/compressed) layout — the standard FullAttentionSpec formula
+        # over-sizes TQ/KVarN pages and would inflate the shared page below.
+        primary_page = cls._attn_page_size_1_token(vllm_config)
 
         # Per-token page of every higher-precision padded spec sharing the pool.
         padded_pages: list[int] = []
         if cache_config.kv_cache_dtype_skip_layers:
-            padded_pages.append(per_token_page_bytes(model_config.dtype, "auto"))
+            padded_pages.append(per_token_page_bytes(model_config.dtype))
         # To add the first/last-N sibling:
-        #   padded_pages.append(per_token_page_bytes(<sibling_dtype>, "auto"))
+        #   padded_pages.append(per_token_page_bytes(<sibling_dtype>))
         if not padded_pages:
             return
 
@@ -762,26 +759,22 @@ class Platform:
             cache_config.mamba_page_size_padded = shared_page
 
     @classmethod
-    def _align_hybrid_block_size(
-        cls,
-        vllm_config: "VllmConfig",
-        backend_cls: "type[AttentionBackend]",
-    ) -> None:
+    def _attn_page_size_1_token(cls, vllm_config: "VllmConfig") -> int:
         """
-        For hybrid attention/mamba models, ensure that the attention page
-        size is >= the mamba page size, and pad the mamba page size to match.
+        Per-token attention page size (bytes) for the active cache dtype.
+
+        TQ/KVarN pack K|V into a compressed per-(token, head) slot, so the
+        standard FullAttentionSpec formula (head_size * dtype) over-sizes
+        the page. Use the real packed slot bytes in that case; the standard
+        formula otherwise.
         """
         from math import lcm
 
-        from vllm.config.vllm import set_current_vllm_config
-        from vllm.model_executor.models import ModelRegistry
-        from vllm.utils.math_utils import cdiv
         from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-        from vllm.v1.attention.backend import MultipleOf
         from vllm.v1.kv_cache_interface import (
             FullAttentionSpec,
-            MambaSpec,
             MLAAttentionSpec,
+            TQFullAttentionSpec,
             get_kv_quant_mode,
         )
 
@@ -796,16 +789,15 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
         if model_config.use_mla:
-            attn_page_size_1_token = MLAAttentionSpec(
+            return MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
-        elif cache_config.cache_dtype.startswith("turboquant_"):
+        if cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
             # formula over-sizes it and trips unify_kv_cache_spec_page_size
             # when all attention layers are TQ. With mixed skip+TQ the skip
@@ -814,7 +806,6 @@ class Platform:
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
 
             tq_cfg = TurboQuantConfig.from_cache_dtype(
                 cache_config.cache_dtype, model_config.get_head_size()
@@ -838,29 +829,28 @@ class Platform:
                 # lcm, not max: skip_page is often not a multiple of
                 # tq_page, so max would leave per-layer page sizes
                 # un-unifiable downstream.
-                attn_page_size_1_token = lcm(tq_page, skip_page)
-            else:
-                attn_page_size_1_token = tq_page
-        elif cache_config.cache_dtype.startswith("kvarn_") and not (
+                return lcm(tq_page, skip_page)
+            return tq_page
+        if cache_config.cache_dtype.startswith("kvarn_") and not (
             cache_config.cache_dtype.startswith("kvarn_mla")
         ):
-            # KVarN (non-MLA) packs K|V into a compressed per-(token,head) slot,
-            # like TQ. The standard FullAttentionSpec formula over-sizes the page
-            # (uses FP16 head_size*dtype) and trips unify_kv_cache_spec_page_size
-            # in hybrid models, because the mamba padding is then sized to the
-            # FP16 page while the real KVarN page is ~4x smaller and no longer
-            # divides it. Use the real KVarN slot bytes (matches the
-            # TQFullAttentionSpec built in attention.py for kvarn_ dtypes).
+            # KVarN (non-MLA) packs K|V into a compressed per-(token,head)
+            # slot, like TQ. The standard FullAttentionSpec formula over-sizes
+            # the page (uses FP16 head_size*dtype) and trips
+            # unify_kv_cache_spec_page_size in hybrid models, because the
+            # mamba padding is then sized to the FP16 page while the real
+            # KVarN page is ~4x smaller and no longer divides it. Use the real
+            # KVarN slot bytes (matches the TQFullAttentionSpec built in
+            # attention.py for kvarn_ dtypes).
             from vllm.model_executor.layers.quantization.kvarn.config import (
                 KVarNConfig,
             )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
 
             kvarn_cfg = KVarNConfig.from_cache_dtype(
                 cache_config.cache_dtype, model_config.get_head_size()
             )
             slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
-            attn_page_size_1_token = TQFullAttentionSpec(
+            return TQFullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
@@ -869,14 +859,36 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
                 tq_slot_size=slot_bytes,
             ).page_size_bytes
-        else:
-            attn_page_size_1_token = FullAttentionSpec(
-                block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
-                dtype=kv_cache_dtype,
-                kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+        return FullAttentionSpec(
+            block_size=1,
+            num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+            head_size=model_config.get_head_size(),
+            dtype=kv_cache_dtype,
+            kv_quant_mode=kv_quant_mode,
+        ).page_size_bytes
+
+    @classmethod
+    def _align_hybrid_block_size(
+        cls,
+        vllm_config: "VllmConfig",
+        backend_cls: "type[AttentionBackend]",
+    ) -> None:
+        """
+        For hybrid attention/mamba models, ensure that the attention page
+        size is >= the mamba page size, and pad the mamba page size to match.
+        """
+        from math import lcm
+
+        from vllm.config.vllm import set_current_vllm_config
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.attention.backend import MultipleOf
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+
+        attn_page_size_1_token = cls._attn_page_size_1_token(vllm_config)
 
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
