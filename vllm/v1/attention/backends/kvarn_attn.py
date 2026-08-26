@@ -180,6 +180,30 @@ class KVarNAttentionBackend(AttentionBackend):
         return super().get_preferred_block_size(default_block_size)
 
     @classmethod
+    def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+        """KVarN packs K|V into one compressed per-(token, head) slot.
+
+        Called on every layer spec by the runner and the platform's
+        block/page alignment; the dense kvarn_ dtypes publish their packed
+        slot byte count, skip layers (NONE mode) and the MLA dtype pass
+        through unchanged (MLA layouts are set by mla_attention).
+        """
+        if spec.state_content_bytes is not None:
+            return spec
+        mode_name = spec.kv_quant_mode.name
+        if not mode_name.startswith("KVARN_") or mode_name.startswith("KVARN_MLA"):
+            return spec
+        from dataclasses import replace
+
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVarNConfig,
+        )
+
+        # Member names mirror the cache-dtype strings (see KVQuantMode).
+        cfg = KVarNConfig.from_cache_dtype(mode_name.lower(), spec.head_size)
+        return replace(spec, state_content_bytes=cfg.tile_bytes_aligned // cfg.group)
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         return attn_type == AttentionType.DECODER
 
@@ -219,9 +243,9 @@ class KVarNAttentionBackend(AttentionBackend):
         — no leading 2 (K and V share the record), and no per-position dim.
 
         The total bytes per block (= ``num_kv_heads * tile_bytes_aligned``)
-        equals ``block_size * num_kv_heads * slot_size`` from
-        ``TQFullAttentionSpec.page_size_bytes`` when ``slot_size = tile_bytes
-        / block_size``, so vLLM's memory accounting works unchanged.
+        equals the spec's ``page_size_bytes`` once ``customize_spec`` has
+        published ``state_content_bytes = tile_bytes_aligned / group``
+        (block_size == group), so vLLM's memory accounting works unchanged.
         """
         from vllm.model_executor.layers.quantization.kvarn.config import (
             KVarNConfig,
