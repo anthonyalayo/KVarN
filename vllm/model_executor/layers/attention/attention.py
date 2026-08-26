@@ -144,11 +144,6 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer._v_scale_cpu = torch.tensor(1.0, dtype=torch.float32)
     layer._prob_scale_float = 1.0
 
-    # Initialize q/k/v range constants used by calc_kv_scales
-    layer.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
-    layer.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
-    layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
-
 
 def _init_kv_cache_quant(
     layer: nn.Module,
@@ -270,10 +265,8 @@ class Attention(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
-            calculate_kv_scales = cache_config.calculate_kv_scales
         else:
             kv_cache_dtype = "auto"
-            calculate_kv_scales = False
 
         # llm-compressor models declare an FP8 KV-cache scheme in their
         # checkpoint config. Honor it only when the user did not explicitly
@@ -284,10 +277,8 @@ class Attention(nn.Module, AttentionLayerBase):
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
         if kv_cache_scheme is not None and kv_cache_dtype == "auto":
             kv_cache_dtype = "fp8"
-            calculate_kv_scales = False
             if cache_config is not None:
                 cache_config.cache_dtype = "fp8"
-                cache_config.calculate_kv_scales = False
 
         # Check if per-head quant scales are required based on kv_cache_scheme
         use_per_head_quant_scales = (
@@ -312,7 +303,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 skip = True
             if skip:
                 kv_cache_dtype = "auto"
-                calculate_kv_scales = False
             logger.debug(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
                 prefix,
@@ -324,7 +314,6 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype, vllm_config.model_config
         )
         self.kv_cache_dtype = kv_cache_dtype
-        self.calculate_kv_scales = calculate_kv_scales
         if num_kv_heads is None:
             num_kv_heads = num_heads
         assert num_heads % num_kv_heads == 0, (
@@ -477,7 +466,8 @@ class Attention(nn.Module, AttentionLayerBase):
         if (
             self.impl.supports_quant_query_input
             and (
-                self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "nvfp4"
+                self.kv_cache_dtype.startswith("fp8")
+                or self.kv_cache_dtype.startswith("nvfp4")
             )
             and not self.kv_cache_dtype.endswith("per_token_head")
         ):
@@ -512,10 +502,6 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
-        if self.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(
-                query, key, value, _encode_layer_name(self.layer_name)
-            )
         if output_dtype is None:
             output_dtype = query.dtype
         if self.query_quant is not None:
@@ -524,7 +510,9 @@ class Attention(nn.Module, AttentionLayerBase):
             # which reduces overheads during decoding.
             # Otherwise queries are quantized using custom ops
             # which causes decoding overheads
-            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3", "nvfp4"}
+            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"} or (
+                self.kv_cache_dtype.startswith("nvfp4")
+            )
 
             # check if query quantization is supported
             if self.impl.supports_quant_query_input:
@@ -588,18 +576,6 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         return output.view(-1, hidden_size)
 
-    def calc_kv_scales(self, query, key, value):
-        self._q_scale.copy_(torch.abs(query).max() / self.q_range)
-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
-        self._q_scale_float = self._q_scale.item()
-        self._k_scale_float = self._k_scale.item()
-        self._v_scale_float = self._v_scale.item()
-        self._k_scale_cpu.fill_(self._k_scale_float)
-        self._v_scale_cpu.fill_(self._v_scale_float)
-        # We only calculate the scales once
-        self.calculate_kv_scales = False
-
     def extra_repr(self) -> str:
         s = f"head_size={self.impl.head_size}"  # type: ignore
         s += f", num_heads={self.impl.num_heads}"  # type: ignore
@@ -642,31 +618,6 @@ class Attention(nn.Module, AttentionLayerBase):
             assert not self.attn_backend.is_mla(), (
                 "MLA is not supported for sliding window"
             )
-            # KVarN-compressed sliding-window layer: report the packed KVarN
-            # per-slot byte count via a TQ-aware sliding spec, but keep the
-            # SlidingWindowManager (so out-of-window blocks are still evicted).
-            # Worthwhile only when sliding_window > group (full int4 tiles fit
-            # inside the window); KVarN gates this on KVARN_QUANT_SLIDING.
-            if self.kv_cache_dtype.startswith("kvarn_") and not self.kv_cache_dtype.startswith("kvarn_mla"):
-                from vllm.model_executor.layers.quantization.kvarn.config import (
-                    KVarNConfig,
-                )
-                from vllm.v1.kv_cache_interface import TQSlidingWindowSpec
-
-                kvarn_cfg = KVarNConfig.from_cache_dtype(
-                    self.kv_cache_dtype, self.head_size
-                )
-                slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
-                return TQSlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=self.num_kv_heads,
-                    head_size=self.head_size,
-                    head_size_v=self.head_size,
-                    dtype=self.kv_cache_torch_dtype,
-                    kv_quant_mode=quant_mode,
-                    sliding_window=self.sliding_window,
-                    tq_slot_size=slot_bytes,
-                )
             # SW chooses its own block_size, decoupled from the user's
             # ``--block-size`` (which only constrains primary attention).
             # When this SW layer is a padded spec (skip-quant: its page is
@@ -675,14 +626,17 @@ class Attention(nn.Module, AttentionLayerBase):
             # bytes per block. Otherwise (page_size_padded is None) the smallest
             # block is fine — ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
-            sw_per_token = SlidingWindowSpec(
-                block_size=1,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                head_size_v=self.head_size_v,
-                dtype=self.kv_cache_torch_dtype,
-                kv_quant_mode=quant_mode,
-                sliding_window=self.sliding_window,
+            # The backend owns its packing
+            sw_per_token = self.attn_backend.customize_spec(
+                SlidingWindowSpec(
+                    block_size=1,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                    sliding_window=self.sliding_window,
+                )
             ).real_page_size_bytes
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, shared_page, block_size
@@ -697,48 +651,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
                 page_size_padded=shared_page,
             )
-        elif self.kv_cache_dtype.startswith("turboquant_"):
-            from vllm.model_executor.layers.quantization.turboquant.config import (
-                TurboQuantConfig,
-            )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
-
-            tq_config = TurboQuantConfig.from_cache_dtype(
-                self.kv_cache_dtype, self.head_size
-            )
-            return TQFullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                head_size_v=self.head_size,
-                dtype=self.kv_cache_torch_dtype,
-                kv_quant_mode=quant_mode,
-                tq_slot_size=tq_config.slot_size_aligned,
-            )
-        elif self.kv_cache_dtype.startswith("kvarn_") and not self.kv_cache_dtype.startswith("kvarn_mla"):
-            from vllm.model_executor.layers.quantization.kvarn.config import (
-                KVarNConfig,
-            )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
-
-            kvarn_cfg = KVarNConfig.from_cache_dtype(
-                self.kv_cache_dtype, self.head_size
-            )
-            # KVarN's per-slot byte count = tile_bytes_aligned / block_size.
-            # We reuse the TQ spec class because the on-disk layout primitive
-            # (a uint8 block of per-(token,head) "slots") is the same; only the
-            # slot semantics differ. This gives the packed per-block page size
-            # so vLLM allocates blocks at the compressed size.
-            slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
-            return TQFullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                head_size_v=self.head_size,
-                dtype=self.kv_cache_torch_dtype,
-                kv_quant_mode=quant_mode,
-                tq_slot_size=slot_bytes,
-            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,
@@ -748,41 +660,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
             )
-
-
-def maybe_calc_kv_scales(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    layer_name = _resolve_layer_name(layer_name)
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-
-    # Only calculate if the layer's calculate_kv_scales flag is True
-    # This flag gets set to False after the first forward pass
-    if not self.calculate_kv_scales:
-        return
-
-    self.calc_kv_scales(query, key, value)
-
-
-def maybe_calc_kv_scales_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="maybe_calc_kv_scales",
-    op_func=maybe_calc_kv_scales,
-    mutates_args=["query", "key", "value"],
-    fake_impl=maybe_calc_kv_scales_fake,
-)
 
 
 def get_attention_context(
