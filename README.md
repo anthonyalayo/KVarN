@@ -4,6 +4,22 @@
 [![hf-space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Huawei%20CSL-ffc107?color=ffc107&logoColor=white)](https://huggingface.co/huawei-csl)
 [![GitHub stars](https://img.shields.io/github/stars/huawei-csl/KVarN?label=Stars&logo=github&logoColor=white&style=flat-square)](https://github.com/huawei-csl/KVarN/stargazers)
 
+> **dev note (local fork):** this is KVarN rebased onto vLLM v0.27.1
+> (upstream was v0.23.0), with the KVarN patches re-applied to the new
+> KV-cache spec plumbing. What's different from upstream KVarN:
+>
+> - kvarn_ dtypes map to the TQ quant mode in v0.27's KVQuantMode plumbing —
+>   without this the runner resolves the cache dtype to "auto" and engine
+>   startup dies.
+> - hybrid (GDN/mamba) models: block-size + page alignment now come from
+>   KVarN's packed page (the old plain-attention formula doubled the mamba
+>   page and crashed initialize_kv_cache with MTP on), and the metadata
+>   builder tracks pool slots / sinks / flushes in tile units (hybrid blocks
+>   are 25 x 128 tiles; the old block-id keying did OOB block-table reads
+>   and garbage KV).
+> - DEV_NOTES.md: the stale flashinfer-cubin reinstall after base bumps.
+>
+> dense + MLA + spec decode are unchanged from upstream.
 
 
 <p align="center">
