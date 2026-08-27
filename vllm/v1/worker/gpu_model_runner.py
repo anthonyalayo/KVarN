@@ -220,7 +220,10 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker.gpu.attn_utils import (
+    _reshape_attention_kv_cache,
+    tag_spec_decode_draft_specs,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -7933,7 +7936,11 @@ class GPUModelRunner(
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
                     spec = backend.customize_spec(spec)
                 kv_cache_spec[layer_name] = spec
-
+        tag_spec_decode_draft_specs(
+            self.vllm_config,
+            kv_cache_spec,
+            getattr(getattr(self, "drafter", None), "model", None),
+        )
         return kv_cache_spec
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:

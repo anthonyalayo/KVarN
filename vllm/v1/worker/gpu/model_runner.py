@@ -83,6 +83,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    tag_spec_decode_draft_specs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -490,7 +491,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         if self.is_encoder_only:
             return {}
-        return get_kv_cache_spec(self.vllm_config)
+        kv_cache_spec = get_kv_cache_spec(self.vllm_config)
+        tag_spec_decode_draft_specs(
+            self.vllm_config,
+            kv_cache_spec,
+            self.speculator.model
+            if isinstance(self.speculator, DraftModelSpeculator)
+            else None,
+        )
+        return kv_cache_spec
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)

@@ -1792,39 +1792,73 @@ def get_kv_cache_groups(
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
-    hidden_specs = {
-        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
-    }
-    filtered_spec = {
+    # Spec-decode draft attention layers are pulled out the same way: a
+    # drafter with a larger per-token KV cost than the target (e.g. a DFlash2
+    # drafter with 8x128 sliding-window heads on a 4x256 KVarN target) would
+    # otherwise pad every target layer up to the draft's page, shrinking the
+    # pool by the ratio of the two pages.
+    pulled_specs = {
         k: v
         for k, v in kv_cache_spec.items()
-        if not isinstance(v, HiddenStateCacheSpec)
+        if isinstance(v, HiddenStateCacheSpec)
+        or (isinstance(v, AttentionSpec) and getattr(v, "is_spec_decode_draft", False))
     }
+    filtered_spec = {k: v for k, v in kv_cache_spec.items() if k not in pulled_specs}
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
     try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        unified_spec = unify_kv_cache_spec_page_size(dict(filtered_spec))
     except NotImplementedError:
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
             raise
         return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
-    # Add hidden-state layers back with page aligned to the common page.
-    if hidden_specs:
-        common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
-        group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
-        for name, spec in hidden_specs.items():
-            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+    # Draft specs whose page already matches the unified target page rejoin
+    # the main pool (no unification impact); the rest are aligned to the
+    # common page below.
+    common_page = (
+        get_uniform_page_size(unified_spec.values())
+        if unified_spec
+        else max((spec.page_size_bytes for spec in pulled_specs.values()), default=0)
+    )
+    for name, spec in pulled_specs.items():
+        if (
+            not isinstance(spec, HiddenStateCacheSpec)
+            and spec.page_size_bytes == common_page
+        ):
+            unified_spec[name] = spec
+    aligned_specs = {
+        name: spec for name, spec in pulled_specs.items() if name not in unified_spec
+    }
+
+    groups = _get_kv_cache_groups_uniform_page_size(unified_spec)
+
+    # Add hidden-state and draft layers back, each as its own group with its
+    # page aligned to the common page.
+    if aligned_specs:
+        group_block_sizes = [
+            g.kv_cache_spec.block_size for g in groups if g.kv_cache_spec.block_size > 0
+        ]
+        group_block_size = math.gcd(*group_block_sizes) if group_block_sizes else 1
+        for name, spec in aligned_specs.items():
+            if isinstance(spec, AttentionSpec):
+                per_token = spec.unpadded_page_size_bytes // spec.block_size
+            else:
+                per_token = (
+                    spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+                )
             max_block_size = max(common_page // per_token, 1)
             new_bs = _largest_divisor_at_most(group_block_size, max_block_size)
             wasted_bytes = common_page - new_bs * per_token
             logger.info(
-                "Using block size %d for hidden-state cache layer %s; "
-                "page alignment wastes %d bytes (%.2f%%) per block",
+                "Using block size %d for %s layer %s; page alignment wastes %d "
+                "bytes (%.2f%%) per block",
                 new_bs,
+                "spec-decode draft"
+                if isinstance(spec, AttentionSpec)
+                else "hidden-state cache",
                 name,
                 wasted_bytes,
                 wasted_bytes / common_page * 100,

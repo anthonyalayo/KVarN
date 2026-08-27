@@ -243,6 +243,13 @@ class AttentionSpec(KVCacheSpec):
     """
     state_content_bytes: int | None = None
     """C in bytes when packed; None means dense K/V content."""
+    is_spec_decode_draft: bool = False
+    """Whether this layer belongs to a spec-decode draft model. The pool
+    sizing keeps such layers out of the target model's page-size unification
+    when their page would dominate it (see get_kv_cache_groups), so a
+    drafter with a larger per-token KV cost cannot pad the whole pool up to
+    the draft's page size.
+    """
 
     def __post_init__(self):
         if self.head_size_v is None:

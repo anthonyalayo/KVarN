@@ -80,6 +80,35 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     return kv_cache_spec
 
 
+def tag_spec_decode_draft_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    draft_model: torch.nn.Module | None,
+) -> None:
+    """Tag the spec-decode draft model's attention layers in the merged KV
+    cache spec (in-place), so the pool sizing can keep them out of the
+    target model's page-size unification when their page would dominate it
+    (a drafter with a larger per-token KV cost than the target must not pad
+    the whole pool up to the draft's page size).
+    """
+    if draft_model is None:
+        return
+    draft_attn_ids = {
+        id(module)
+        for module in draft_model.modules()
+        if isinstance(module, AttentionLayerBase)
+    }
+    if not draft_attn_ids:
+        return
+    forward_context = vllm_config.compilation_config.static_forward_context
+    for name, module in forward_context.items():
+        if id(module) not in draft_attn_ids:
+            continue
+        spec = kv_cache_spec.get(name)
+        if isinstance(spec, AttentionSpec):
+            kv_cache_spec[name] = replace(spec, is_spec_decode_draft=True)
+
+
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
     return {
