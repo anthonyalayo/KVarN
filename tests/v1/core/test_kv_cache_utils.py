@@ -2256,6 +2256,109 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     ) == (544, 136)
 
 
+def test_tagged_full_attention_draft_rejoins_target_group():
+    """A spec-decode draft whose attention layout matches the target's
+    (same page size) is tagged by the worker and must rejoin the target's
+    pool. get_kv_cache_groups strips the is_spec_decode_draft tag when
+    materializing group specs: FullAttentionSpec.merge requires equality of
+    every AttentionSpec field, so a surviving tag raises AssertionError for
+    any group the draft lands in (observed with MTP on a KVarN GDN hybrid).
+    """
+    block_size = 544
+    full_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+    )
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((557056,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="align",
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        is_spec_decode_draft=True,
+    )
+    assert draft_spec.page_size_bytes == full_spec.page_size_bytes
+
+    groups = get_kv_cache_groups(
+        _grouping_config(),
+        {
+            "model.layers.0.self_attn.attn": full_spec,
+            "model.layers.4.self_attn.attn": full_spec,
+            "mtp.layers.0.self_attn.attn": draft_spec,
+            "model.layers.1.linear_attn": mamba_spec,
+            "model.layers.2.linear_attn": mamba_spec,
+        },
+    )
+
+    # The draft shares a group with a target full-attention layer, and no
+    # materialized group spec carries the sizing tag.
+    draft_group = next(
+        group for group in groups if "mtp.layers.0.self_attn.attn" in group.layer_names
+    )
+    assert any("self_attn" in name for name in draft_group.layer_names), (
+        draft_group.layer_names
+    )
+    assert all(
+        getattr(group.kv_cache_spec, "is_spec_decode_draft", False) is False
+        for group in groups
+    )
+
+
+def test_tagged_full_attention_draft_aligned_group_drops_tag():
+    """A tagged draft whose page does not match the unified page gets its
+    own group aligned to the common page. The aligned spec must not carry
+    the tag either: the singleton group is still merged via
+    FullAttentionSpec.merge, which rebuilds the spec without the tag and
+    then asserts field equality against the inputs.
+    """
+    block_size = 128
+    full_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((16384,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="align",
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        is_spec_decode_draft=True,
+    )
+    assert full_spec.page_size_bytes == mamba_spec.page_size_bytes == 32768
+    assert draft_spec.page_size_bytes == 65536
+
+    groups = get_kv_cache_groups(
+        _grouping_config(),
+        {
+            "model.layers.0.self_attn.attn": full_spec,
+            "mtp.layers.0.self_attn.attn": draft_spec,
+            "model.layers.1.linear_attn": mamba_spec,
+        },
+    )
+
+    draft_group = next(
+        group for group in groups if "mtp.layers.0.self_attn.attn" in group.layer_names
+    )
+    assert draft_group.layer_names == ["mtp.layers.0.self_attn.attn"]
+    aligned = draft_group.kv_cache_spec
+    assert aligned.page_size_bytes == 32768
+    assert aligned.is_spec_decode_draft is False
+
+
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():
     specs = {
         "target.0.attn": new_mla_spec(),

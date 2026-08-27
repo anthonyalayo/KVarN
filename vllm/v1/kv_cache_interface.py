@@ -248,7 +248,9 @@ class AttentionSpec(KVCacheSpec):
     sizing keeps such layers out of the target model's page-size unification
     when their page would dominate it (see get_kv_cache_groups), so a
     drafter with a larger per-token KV cost cannot pad the whole pool up to
-    the draft's page size.
+    the draft's page size. The tag is a sizing-input marker only:
+    get_kv_cache_groups drops it when materializing the layer's group spec,
+    so group specs never carry it.
     """
 
     def __post_init__(self):

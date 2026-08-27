@@ -1828,7 +1828,11 @@ def get_kv_cache_groups(
             not isinstance(spec, HiddenStateCacheSpec)
             and spec.page_size_bytes == common_page
         ):
-            unified_spec[name] = spec
+            # The tag is a sizing-input marker only: drop it so the spec is
+            # indistinguishable from its pool peers (merge() requires field
+            # equality, and a draft with the target's layout must rejoin the
+            # target's group).
+            unified_spec[name] = replace(spec, is_spec_decode_draft=False)
     aligned_specs = {
         name: spec for name, spec in pulled_specs.items() if name not in unified_spec
     }
@@ -1863,6 +1867,8 @@ def get_kv_cache_groups(
                 wasted_bytes,
                 wasted_bytes / common_page * 100,
             )
+            if isinstance(spec, AttentionSpec):
+                spec = replace(spec, is_spec_decode_draft=False)
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
