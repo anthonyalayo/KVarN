@@ -46,8 +46,7 @@ def test_customize_spec_publishes_packed_slot_for_full_attention():
     )
     out = KVarNAttentionBackend.customize_spec(spec)
     expected_slot = (
-        KVarNConfig.from_cache_dtype("kvarn_k4v2_g128", 128).tile_bytes_aligned
-        // 128
+        KVarNConfig.from_cache_dtype("kvarn_k4v2_g128", 128).tile_bytes_aligned // 128
     )
     assert expected_slot == 108
     assert out.state_content_bytes == 108
@@ -107,6 +106,69 @@ def test_turboquant_mode_split_is_intact():
     rename did not break the dtype -> mode mapping."""
     assert KVQuantMode.TURBOQUANT_K8V4.value == 6
     assert get_kv_quant_mode("turboquant_k8v4") is KVQuantMode.TURBOQUANT_K8V4
+
+
+def test_sw_skip_layer_block_fills_shared_page():
+    """Real-model regression (Qwen3.8-27B KVarN + dflash2): the draft's SWA
+    layers are skip layers (dense bf16, 4096 B/token) padded to the shared
+    3,407,872-byte page. FlashAttention advertises MultipleOf(16) — any
+    multiple of 16 is a valid kernel block — so the largest block whose page
+    fits the shared page is 832 (fills it exactly), not the base 16. At
+    block 16 the 6,143-token window (2047 + 4096 in-flight) spans
+    cdiv(6143, 16) + 1 = 385 near-empty 3.4 MB blocks per request and
+    auto-fit collapses the pool from the full 262144 context to 43264
+    tokens; at block 832 it is 9 blocks and the full context fits."""
+    from vllm.model_executor.layers.attention.attention import (
+        _largest_kernel_block_within,
+    )
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.attention.backend import MultipleOf
+
+    class _MultipleOf16Backend:
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [MultipleOf(16)]
+
+    block = _largest_kernel_block_within(_MultipleOf16Backend, 4096, 3_407_872, 128)
+    assert block == 832
+    assert cdiv(6143, block) + 1 == 9
+
+
+def test_sw_kernel_block_no_budget_uses_smallest_supported():
+    """Without a page budget (no shared page to pad into) the smallest
+    supported block is returned — unify scales it up by an integer ratio."""
+    from vllm.model_executor.layers.attention.attention import (
+        _largest_kernel_block_within,
+    )
+    from vllm.v1.attention.backend import MultipleOf
+
+    class _MultipleOf16Backend:
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [MultipleOf(16)]
+
+    assert _largest_kernel_block_within(_MultipleOf16Backend, 4096, None, 128) == 16
+    assert _largest_kernel_block_within(_MultipleOf16Backend, 0, 3_407_872, 128) == 16
+
+
+def test_sw_kernel_block_fixed_sizes_unchanged():
+    """Backends advertising fixed int sizes keep the existing behavior: the
+    largest listed size that fits the budget, else the smallest."""
+    from vllm.model_executor.layers.attention.attention import (
+        _largest_kernel_block_within,
+    )
+
+    class _FixedBackend:
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [64, 128]
+
+    # 128 * 108 = 13824 fits 3_407_872; budget smaller than the 128 page
+    # falls back to 64.
+    assert _largest_kernel_block_within(_FixedBackend, 108, 3_407_872, 128) == 128
+    assert _largest_kernel_block_within(_FixedBackend, 108, 8192, 128) == 64
+    # Nothing fits: the smallest listed size is returned (pre-existing).
+    assert _largest_kernel_block_within(_FixedBackend, 108, 1024, 128) == 64
 
 
 if __name__ == "__main__":

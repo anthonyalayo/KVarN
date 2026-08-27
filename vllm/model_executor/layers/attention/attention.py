@@ -109,16 +109,25 @@ def _largest_kernel_block_within(
     from vllm.v1.attention.backend import MultipleOf
 
     sizes = attn_backend.get_supported_kernel_block_sizes()
-    candidates = [s for s in sizes if isinstance(s, int)]
-    if not candidates:
-        candidates = [s.base for s in sizes if isinstance(s, MultipleOf)]
-    if not candidates:
+    int_sizes = [s for s in sizes if isinstance(s, int)]
+    multiple_bases = [s.base for s in sizes if isinstance(s, MultipleOf)]
+    if not int_sizes and not multiple_bases:
         return fallback
-    smallest = min(candidates)
     if not page_budget or per_token_bytes <= 0:
-        return smallest
-    fitting = [b for b in candidates if b * per_token_bytes <= page_budget]
-    return max(fitting) if fitting else smallest
+        return min([*int_sizes, *multiple_bases])
+    max_block = page_budget // per_token_bytes
+    fitting = [b for b in int_sizes if b * per_token_bytes <= page_budget]
+    if multiple_bases:
+        # MultipleOf(N) admits every multiple of N. The largest multiple that
+        # fits the budget is a valid kernel block and may fill the budget
+        # exactly; settling for the base size would pad a tiny page up to the
+        # shared page and reserve hundreds of near-empty blocks per request.
+        for base in multiple_bases:
+            fitting.append((max_block // base) * base)
+    fitting = [b for b in fitting if b > 0]
+    if not fitting:
+        return min([*int_sizes, *multiple_bases])
+    return max(fitting)
 
 
 def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) -> None:
