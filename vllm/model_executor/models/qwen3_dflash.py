@@ -487,7 +487,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [self._get_kv_proj_weight(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -500,6 +500,27 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+
+    def _get_kv_proj_weight(self, attn: nn.Module) -> torch.Tensor:
+        """Dense [2 * kv_size, hidden] KV rows of an attention layer's QKV
+        projection.
+
+        Unquantized linears expose the packed QKV weight directly. Quantized
+        linears (e.g. compressed-tensors W4A16 drafts) keep packed weights
+        with no raw ``.weight``, so apply the projection to an identity
+        matrix to recover the dequantized rows.
+        """
+        qkv_proj = attn.qkv_proj
+        q_size = attn.q_size
+        weight = getattr(qkv_proj, "weight", None)
+        if weight is not None:
+            return weight[q_size:]
+        ref = self.hidden_norm.weight
+        eye = torch.eye(qkv_proj.input_size, dtype=ref.dtype, device=ref.device)
+        out = qkv_proj.quant_method.apply(qkv_proj, eye)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.t().contiguous()[q_size:]
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
