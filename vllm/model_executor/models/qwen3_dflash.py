@@ -878,7 +878,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
-        self.model._build_fused_kv_buffers()
+        # The fused context-KV buffer is built after the loader's
+        # process_weights_after_loading (load_dflash_model): a quantized
+        # draft's qkv_proj is only usable in kernel form once the repack
+        # has run. precompute_and_store_context_kv keeps a lazy fallback
+        # for load paths that bypass load_dflash_model.
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

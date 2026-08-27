@@ -49,6 +49,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
+    # Build the fused context-KV buffer after get_model returns, i.e. after
+    # the loader's process_weights_after_loading has run: a quantized draft's
+    # qkv_proj is only usable in kernel form once the repack has happened.
+    dflash_model.model._build_fused_kv_buffers()
+
     target_language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
