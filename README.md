@@ -6,7 +6,26 @@
 
 This is KVarN rebased onto vLLM v0.28.0 (upstream was v0.23.0).
 
-**Quick-serve commands for RTX 5090 32GB VRAM:**
+**My Quick Start:**
+
+```bash
+# 1. Clone
+git clone git@github.com/anthonyalayo/KVarN.git
+cd KVarN
+
+# 2. Setup uv python environment
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv --python 3.12
+
+# 3. Install (tweak the max jobs number to handle OOMs)
+MAX_JOBS=16 uv pip install -e . -v
+
+# 4. Start
+source .venv/bin/activate
+vllm serve <args>
+```
+
+**My Quick Serve (for RTX 5090 32GB VRAM):**
 
 ```bash
 # WINNER: MTP+2 — 303.9 out tok/s (1.27× no-MTP), 1.72× 262K concurrency
