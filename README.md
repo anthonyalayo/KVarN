@@ -21,6 +21,59 @@
 > - DEV_NOTES.md: the stale flashinfer-cubin reinstall after base bumps.
 >
 > dense + MLA + spec decode are unchanged from upstream.
+>
+> **dev note (local) — Qwen3.8-27B-NVFP4-RTX5090, single RTX 5090, spec decode:**
+> 1000-request completions load (1024 in / 128 out, `--max-num-seqs 4`,
+> `kvarn_k4v2_g128`, graph mode). All runs 1000/1000 OK, 0 failed — after the
+> split-K stage1 padded-row IMA fix (`d533c98`).
+
+| | No MTP | MTP+1 | MTP+2 | MTP+3 | DFlash2 (7) |
+| --- | --- | --- | --- | --- | --- |
+| Output tok/s | 240.1 | 293.8 | 303.9 | **309.0** | 160.6 |
+| Total tok/s | 2160.7 | 2644.6 | 2735.2 | **2780.6** | 1445.4 |
+| vs no MTP | 1.00× | 1.22× | 1.27× | **1.29×** | 0.67× |
+| Mean TPOT (ms) | 15.76 | 12.67 | 12.13 | **11.91** | 23.35 |
+| Median ITL (ms) | **14.46** | 16.80 | 19.35 | 20.61 | 21.47 |
+| P99 ITL (ms) | **71.5** | 90.0 | 94.8 | 96.9 | 95.0 |
+| KV cache (tokens) | 574,929 | 466,673 | 451,780 | 437,807 | — |
+| 262K concurrency | 2.19× | 1.78× | 1.72× | 1.67× | — |
+| Acceptance (len) | — | 58.1% (1.58) | 46.5% (1.93) | 37.2% (2.11) | 0.6% (1.04) |
+
+> **Winner: MTP+2** — 98% of MTP+3's throughput with 2.5pp less KV loss (1.72×
+> vs 1.67× 262K concurrency) and the best ITL of the spec configs. MTP+3 only
+> wins on raw tok/s, at the worst KV cap and worst ITL. DFlash2 is a no-go on
+> this workload: 0.6% acceptance (the W4A16 drafter basically never accepts) →
+> 33% slower than no-MTP.
+
+> Quick-serve commands (this box):
+
+```bash
+# WINNER: MTP+2 — 303.9 out tok/s (1.27× no-MTP), 1.72× 262K concurrency
+vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
+    --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
+    --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
+    --gpu-memory-utilization 0.95 \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}' \
+    --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+    --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
+
+# baseline: no MTP — 240.1 out tok/s, 2.19× 262K concurrency
+vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
+    --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
+    --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
+    --gpu-memory-utilization 0.95 \
+    --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+    --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
+
+# DFlash2 — 160.6 out tok/s, 0.6% acceptance; kept for reference, do not use
+vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
+    --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
+    --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
+    --gpu-memory-utilization 0.95 \
+    --speculative-config '{"method":"dflash","model":"syvai/Qwen3.8-27B-DFlash2-W4A16","num_speculative_tokens":7}' \
+    --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+    --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
+```
 
 
 <p align="center">
