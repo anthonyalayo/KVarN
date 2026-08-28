@@ -720,6 +720,12 @@ class SpecDecodeBaseProposer:
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self.hidden_states[:batch_size] = hidden_states
+            # Fence the shared-buffer overwrites against still-in-flight
+            # kernels from the previous draft/target step: without it the
+            # drafter can read stale (or concurrently overwritten)
+            # input_ids/hidden_states, producing invalid draft tokens and
+            # CUDA illegal memory access (vllm-project/vllm#40756).
+            torch.accelerator.current_stream().synchronize()
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
