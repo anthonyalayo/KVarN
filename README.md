@@ -45,6 +45,25 @@
 > this workload: 0.6% acceptance (the W4A16 drafter basically never accepts) →
 > 33% slower than no-MTP.
 
+> **Asterisk (capacity edge @0.96, this box):** at 0.96 the boot-time peak
+> sits only ~140–280 MiB inside the budget — the FlashInfer-autotune dummy
+> forward allocates ~170 MiB of 2048-token GEMM buffers before graph capture,
+> and that forward is sized by `--max-num-batched-tokens` (default 2048), not
+> by `--max-num-seqs`. **MTP+3@0.96** clears it naturally: 472,940 tok, no
+> extra flags. **MTP+2@0.96 does not**: its smaller draft weights buy a larger
+> block-quantized KV (490,822 tok) that eats the margin, and the autotune
+> forward OOMs. Verified workarounds: `--kv-cache-memory 9551856271` (natural
+> 0.96 KV minus 250 MiB margin) → **476,878 tok** — beats MTP+2@0.95
+> (474,090) and MTP+3@0.96 (472,940); absolute bytes, re-derive if the GPU or
+> co-tenants change. Untried here, in order of expected KV:
+> `--max-num-batched-tokens 1536` (shrinks the boot peak 170→128 MiB; should
+> recover the full ~490K) · `--gpu-memory-utilization 0.955` (~481K).
+> `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` does **not** help: the KV
+> consumes the un-reserved 0.12 GiB estimate before the autotune phase, so
+> free space at the OOM instant is unchanged. **0.97 is a hard OOM by
+> arithmetic**: 964 MiB margin vs ~1,007 MiB of above-budget overhead (566 MiB
+> in-process non-torch + ~400 MiB autotune transient + 41 MiB driver).
+
 > Quick-serve commands (this box):
 
 ```bash
