@@ -81,6 +81,14 @@ class SpecDecodeBaseProposer:
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
+        # TEMP marker: proves the #40756 buffer-sync fence is loaded.
+        # Remove after runtime verification.
+        logger.warning(
+            "[mtp-fence-check] drafter ready (method=%s, n=%s): "
+            "draft-loop buffer-sync fence is ACTIVE",
+            self.method,
+            self.num_speculative_tokens,
+        )
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self._share_mtp_indices = False
 
