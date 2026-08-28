@@ -87,7 +87,7 @@ class SpecDecodeBaseProposer:
             "[mtp-fence-check] drafter ready (method=%s, n=%s): "
             "draft-loop buffer-sync fence is ACTIVE",
             self.method,
-            self.num_speculative_tokens,
+            self.speculative_config.num_speculative_tokens,
         )
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self._share_mtp_indices = False
