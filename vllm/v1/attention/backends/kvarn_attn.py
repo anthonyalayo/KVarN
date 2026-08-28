@@ -916,6 +916,12 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                            non_blocking=True)
             vq_seqlen_t.copy_(self._vq_seqlen_host[:num_decode_tokens],
                               non_blocking=True)
+            # Graph replay runs the capture-time NQ programs; after a batch
+            # shrink, rows past num_decode_tokens are padded and must carry
+            # seq_len 0 (the verify kernels early-exit on it). The buffer is
+            # torch.empty, so the tail would otherwise be stale/garbage.
+            if num_decode_tokens < self._vq_seqlen_buf.shape[0]:
+                self._vq_seqlen_buf[num_decode_tokens:].zero_()
 
         max_blocks_per_req = (self._max_model_len + GROUP - 1) // GROUP
 

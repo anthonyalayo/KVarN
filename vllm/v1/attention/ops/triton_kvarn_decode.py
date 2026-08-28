@@ -703,6 +703,10 @@ def _kvarn_fused_decode_stage1(
     if VQ_INDIRECT:
         bt_row = tl.load(Req_row_ptr + b)
     seq_len = tl.load(Seq_lens_ptr + b)
+    # Padded rows (uniform-batch graph capture/replay pads the token count)
+    # carry seq_len <= 0: nothing to attend, the output row is never read.
+    if seq_len <= 0:
+        return
     n_blocks = (seq_len + GROUP - 1) // GROUP
     blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
     blk_lo = split * blocks_per_split
@@ -729,7 +733,9 @@ def _kvarn_fused_decode_stage1(
         in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
         safe_bid = tl.where(in_range, block_id, 0)
         pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
-        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        # safe_bid (not block_id): an unallocated tile table entry (-1 or
+        # >= NUM_BLOCKS_LOOKUP) must not index KV_cache OOB.
+        tile_base = safe_bid.to(tl.int64) * stride_kv_b + hk * stride_kv_h
         safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
         pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
 
