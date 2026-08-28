@@ -4,74 +4,16 @@
 [![hf-space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Huawei%20CSL-ffc107?color=ffc107&logoColor=white)](https://huggingface.co/huawei-csl)
 [![GitHub stars](https://img.shields.io/github/stars/huawei-csl/KVarN?label=Stars&logo=github&logoColor=white&style=flat-square)](https://github.com/huawei-csl/KVarN/stargazers)
 
-> **dev note (local fork):** this is KVarN rebased onto vLLM v0.28.0
-> (upstream was v0.23.0, then v0.27.1), with the KVarN patches re-applied to
-> the new KV-cache spec plumbing. What's different from upstream KVarN:
->
-> - kvarn_ dtypes map to dedicated KVARN_* KVQuantMode members, and the
->   packed per-(token, head) slot is published through 0.28's backend
->   customize_spec hook (AttentionSpec.state_content_bytes) — 0.28 removed
->   the TQ*Spec packed classes the v0.27.1 build reused.
-> - hybrid (GDN/mamba) models: block-size + page alignment now come from
->   KVarN's packed page (the old plain-attention formula doubled the mamba
->   page and crashed initialize_kv_cache with MTP on), and the metadata
->   builder tracks pool slots / sinks / flushes in tile units (hybrid blocks
->   are 25 x 128 tiles; the old block-id keying did OOB block-table reads
->   and garbage KV).
-> - DEV_NOTES.md: the stale flashinfer-cubin reinstall after base bumps.
->
-> dense + MLA + spec decode are unchanged from upstream.
->
-> **dev note (local) — Qwen3.8-27B-NVFP4-RTX5090, single RTX 5090, spec decode:**
-> 1000-request completions load (1024 in / 128 out, `--max-num-seqs 4`,
-> `kvarn_k4v2_g128`, graph mode). All runs 1000/1000 OK, 0 failed — after the
-> split-K stage1 padded-row IMA fix (`d533c98`).
+This is KVarN rebased onto vLLM v0.28.0 (upstream was v0.23.0).
 
-| | No MTP | MTP+1 | MTP+2 | MTP+3 | DFlash2 (7) |
-| --- | --- | --- | --- | --- | --- |
-| Output tok/s | 240.1 | 293.8 | 303.9 | **309.0** | 160.6 |
-| Total tok/s | 2160.7 | 2644.6 | 2735.2 | **2780.6** | 1445.4 |
-| vs no MTP | 1.00× | 1.22× | 1.27× | **1.29×** | 0.67× |
-| Mean TPOT (ms) | 15.76 | 12.67 | 12.13 | **11.91** | 23.35 |
-| Median ITL (ms) | **14.46** | 16.80 | 19.35 | 20.61 | 21.47 |
-| P99 ITL (ms) | **71.5** | 90.0 | 94.8 | 96.9 | 95.0 |
-| KV cache (tokens) | 574,929 | 466,673 | 451,780 | 437,807 | — |
-| 262K concurrency | 2.19× | 1.78× | 1.72× | 1.67× | — |
-| Acceptance (len) | — | 58.1% (1.58) | 46.5% (1.93) | 37.2% (2.11) | 0.6% (1.04) |
-
-> **Winner: MTP+2** — 98% of MTP+3's throughput with 2.5pp less KV loss (1.72×
-> vs 1.67× 262K concurrency) and the best ITL of the spec configs. MTP+3 only
-> wins on raw tok/s, at the worst KV cap and worst ITL. DFlash2 is a no-go on
-> this workload: 0.6% acceptance (the W4A16 drafter basically never accepts) →
-> 33% slower than no-MTP.
-
-> **Asterisk (capacity edge @0.96, this box):** at 0.96 the boot-time peak
-> sits only ~140–280 MiB inside the budget — the FlashInfer-autotune dummy
-> forward allocates ~170 MiB of 2048-token GEMM buffers before graph capture,
-> and that forward is sized by `--max-num-batched-tokens` (default 2048), not
-> by `--max-num-seqs`. **MTP+3@0.96** clears it naturally: 472,940 tok, no
-> extra flags. **MTP+2@0.96 does not**: its smaller draft weights buy a larger
-> block-quantized KV (490,822 tok) that eats the margin, and the autotune
-> forward OOMs. Verified workarounds: `--kv-cache-memory 9551856271` (natural
-> 0.96 KV minus 250 MiB margin) → **476,878 tok** — beats MTP+2@0.95
-> (474,090) and MTP+3@0.96 (472,940); absolute bytes, re-derive if the GPU or
-> co-tenants change. Untried here, in order of expected KV:
-> `--max-num-batched-tokens 1536` (shrinks the boot peak 170→128 MiB; should
-> recover the full ~490K) · `--gpu-memory-utilization 0.955` (~481K).
-> `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` does **not** help: the KV
-> consumes the un-reserved 0.12 GiB estimate before the autotune phase, so
-> free space at the OOM instant is unchanged. **0.97 is a hard OOM by
-> arithmetic**: 964 MiB margin vs ~1,007 MiB of above-budget overhead (566 MiB
-> in-process non-torch + ~400 MiB autotune transient + 41 MiB driver).
-
-> Quick-serve commands (this box):
+**Quick-serve commands for RTX 5090 32GB VRAM:**
 
 ```bash
 # WINNER: MTP+2 — 303.9 out tok/s (1.27× no-MTP), 1.72× 262K concurrency
 vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
     --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
     --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
-    --gpu-memory-utilization 0.95 \
+    --kv-cache-memory 9551856271 \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}' \
     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
@@ -94,6 +36,47 @@ vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
     --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
 ```
 
+**Note: `--kv-cache-memory 9551856271` gets a gpu util between 0.95 and 0.96 on the MTP+2 case.**
+
+What's different from upstream KVarN:
+
+- kvarn_ dtypes map to dedicated KVARN_* KVQuantMode members, and the
+  packed per-(token, head) slot is published through 0.28's backend
+  customize_spec hook (AttentionSpec.state_content_bytes) — 0.28 removed
+  the TQ*Spec packed classes the v0.27.1 build reused.
+- hybrid (GDN/mamba) models: block-size + page alignment now come from
+  KVarN's packed page (the old plain-attention formula doubled the mamba
+  page and crashed initialize_kv_cache with MTP on), and the metadata
+  builder tracks pool slots / sinks / flushes in tile units (hybrid blocks
+  are 25 x 128 tiles; the old block-id keying did OOB block-table reads
+  and garbage KV).
+- DEV_NOTES.md: the stale flashinfer-cubin reinstall after base bumps.
+
+dense + MLA + spec decode are unchanged from upstream.
+
+**Speculative decode profiling with "vllm bench serve --port 8000"**
+
+All run with flavors of the above quick-serve commands.
+
+| | No MTP | MTP+1 | MTP+2 | MTP+3 | DFlash2 (7) |
+| --- | --- | --- | --- | --- | --- |
+| Output tok/s | 240.1 | 293.8 | 303.9 | **309.0** | 160.6 |
+| Total tok/s | 2160.7 | 2644.6 | 2735.2 | **2780.6** | 1445.4 |
+| vs no MTP | 1.00× | 1.22× | 1.27× | **1.29×** | 0.67× |
+| Mean TPOT (ms) | 15.76 | 12.67 | 12.13 | **11.91** | 23.35 |
+| Median ITL (ms) | **14.46** | 16.80 | 19.35 | 20.61 | 21.47 |
+| P99 ITL (ms) | **71.5** | 90.0 | 94.8 | 96.9 | 95.0 |
+| KV cache (tokens) | 574,929 | 466,673 | 451,780 | 437,807 | — |
+| 262K concurrency | 2.19× | 1.78× | 1.72× | 1.67× | — |
+| Acceptance (len) | — | 58.1% (1.58) | 46.5% (1.93) | 37.2% (2.11) | 0.6% (1.04) |
+
+**Winner: MTP+2** — 98% of MTP+3's throughput with 2.5pp less KV loss (1.72×
+vs 1.67× 262K concurrency) and the best ITL of the spec configs. MTP+3 only
+wins on raw tok/s, at the worst KV cap and worst ITL. DFlash2 is a no-go on
+this workload: 0.6% acceptance (the W4A16 drafter basically never accepts) →
+33% slower than no-MTP.
+
+---
 
 <p align="center">
   <img src="imgs/logo_600.png" alt="KVarN" width="640">
