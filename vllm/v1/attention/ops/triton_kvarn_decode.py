@@ -585,7 +585,9 @@ def _kvarn_fused_decode_kernel(
         safe_bid = tl.where(in_range, block_id, 0)
         pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
 
-        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        # safe_bid (not block_id): an unallocated tile table entry (-1 or
+        # >= NUM_BLOCKS_LOOKUP) must not index KV_cache OOB.
+        tile_base = safe_bid.to(tl.int64) * stride_kv_b + hk * stride_kv_h
         safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
         pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
 
@@ -907,7 +909,7 @@ def kvarn_decode_attention(
     # (max_num_seqs * Hq rows); never split if this batch would overflow them
     # (defensive — real decode batches always fit, but a padded dummy run can
     # be wider). The single-stage kernel handles any batch size.
-    _mid_fits = impl._mid_o_buf is not None and N <= impl._mid_o_buf.shape[0]
+    _mid_fits = impl._mid_o_buf is not None and impl._mid_o_buf.shape[0] >= N
     _sk_env = os.environ.get("KVARN_SPLIT_K")
     if _sk_env is not None:
         split_k = use_fused and _sk_env == "1" and _mid_fits
@@ -1248,7 +1250,11 @@ def _kvarn_fused_verify_stage1(
         in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
         safe_bid = tl.where(in_range, block_id, 0)
         pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
-        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        # safe_bid (not block_id): the tile-table entry can be -1 / out of
+        # range when seq_lens runs ahead of the allocated blocks; the raw
+        # id would index KV_cache OOB (IMA) while the pool_slot load above
+        # is already clamped.
+        tile_base = safe_bid.to(tl.int64) * stride_kv_b + hk * stride_kv_h
         safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
         pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
 
