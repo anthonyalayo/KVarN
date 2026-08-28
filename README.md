@@ -10,6 +10,7 @@ This is KVarN rebased onto vLLM v0.28.0 (upstream was v0.23.0).
 
 ```bash
 # WINNER: MTP+2 — 303.9 out tok/s (1.27× no-MTP), 1.72× 262K concurrency
+# GPU KV cache size: 476,878 tokens, Maximum concurrency for 262,144 tokens per request: 1.82x
 vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
     --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
     --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
@@ -56,7 +57,7 @@ dense + MLA + spec decode are unchanged from upstream.
 
 **Speculative decode profiling with "vllm bench serve --port 8000"**
 
-All run with flavors of the above quick-serve commands.
+All experiments with flavors of the above quick-serve commands, but at 0.95 gpu util (so context window can be even higher than listed).
 
 | | No MTP | MTP+1 | MTP+2 | MTP+3 | DFlash2 (7) |
 | --- | --- | --- | --- | --- | --- |
