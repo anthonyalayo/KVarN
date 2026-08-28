@@ -4,6 +4,7 @@ import gc
 import os
 import queue
 import signal
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
@@ -94,6 +95,21 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+def _git_provenance() -> str:
+    """One-shot git provenance so crash logs identify the code that ran."""
+    try:
+        head = subprocess.run(
+            ["git", "describe", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.strip()
+        subject = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+    return f"{head} ({subject})" if head and subject else (head or "unknown")
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -1288,6 +1304,9 @@ class EngineCoreProc(EngineCore):
             set_process_title(process_title)
             maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
             decorate_logs()
+            logger.info(
+                "KVarN-IMA: engine starting, git HEAD %s", _git_provenance()
+            )
             if parallel_config.numa_bind:
                 numa_utils.log_current_affinity_state(process_title)
 

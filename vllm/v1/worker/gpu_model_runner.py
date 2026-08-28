@@ -1617,6 +1617,53 @@ class GPUModelRunner(
         else:
             return None
 
+    def _log_kvarn_ima_comp(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+    ) -> None:
+        """KVarN-IMA diagnostics (VLLM_KVARN_IMA_DEBUG, default off): emit
+        the bookkeeping numbers the KVarN tile table is built from —
+        runner CPU num_computed, CPU optimistic seq_len, request
+        num_tokens, the scheduler's num_scheduled, and gpu_seq_len, the
+        GPU-corrected seq_len the builder actually consumes in async
+        spec-decode mode (GPU num_computed corrected with the previous
+        step's accepted counts, + num_scheduled) — for every spec-verify
+        request (the only rows where seq_len can run ahead of allocated
+        blocks). Emitted in execute_model right after the builder ran, so
+        the same-step KVarN-IMA-TILE record precedes it in the log, and
+        the record for the crashing step survives both the async fault
+        (sync at get_output) and CUDA_LAUNCH_BLOCKING (fault at the
+        kernel's own launch). b (batch position) is the join key for the
+        builder's KVarN-IMA-TILE record."""
+        if not any(num_scheduled_tokens[:num_reqs] > 1):
+            return
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        comp = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+        opt = self.optimistic_seq_lens_cpu[:num_reqs]
+        # The builder's actual seq_len source. In async spec-decode the GPU
+        # tensor is authoritative (CPU path is the optimistic one); in sync
+        # mode the two are equal, so this extra D2H (debug-gated) is the
+        # value that feeds _tile_row_table in both cases.
+        gpu_sl = self.seq_lens[:num_reqs].cpu()
+        recs = []
+        for b in range(num_reqs):
+            if num_scheduled_tokens[b] <= 1:
+                continue
+            req_id = req_ids[b]
+            recs.append(
+                dict(
+                    req=req_id,
+                    b=b,
+                    num_computed=int(comp[b]),
+                    optimistic_seq_len=int(opt[b]),
+                    gpu_seq_len=int(gpu_sl[b]),
+                    num_tokens=self.requests[req_id].num_tokens,
+                    num_scheduled=int(num_scheduled_tokens[b]),
+                )
+            )
+        logger.warning("KVarN-IMA-COMP %s", recs)
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -4516,6 +4563,8 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if envs.VLLM_KVARN_IMA_DEBUG:
+                self._log_kvarn_ima_comp(num_reqs, num_scheduled_tokens_np)
 
             (
                 input_ids,

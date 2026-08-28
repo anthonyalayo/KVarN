@@ -41,7 +41,9 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -74,6 +76,7 @@ from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+logger = init_logger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -518,6 +521,37 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         tile_bt_np = self._tile_row_table(
             block_table_np, seq_lens_cpu, self._tpr, self._group,
             self._max_tiles)
+        # KVarN-IMA diagnostics (VLLM_KVARN_IMA_DEBUG, default off): the
+        # decode/verify kernels iterate ceil(seq_len/GROUP) tiles and read
+        # tile_bt_np[b, t] as a tile row; a -1 entry there means the request's
+        # seq_len runs ahead of its allocated blocks. Record every violating
+        # request before the faulting kernel runs; b (batch position) is the
+        # join key for the runner's KVarN-IMA-COMP record for the same step.
+        if envs.VLLM_KVARN_IMA_DEBUG:
+            _ima_bad = []
+            for _b, _sl in enumerate(seq_lens_cpu):
+                _n_tiles = (int(_sl) + self._group - 1) // self._group
+                if _n_tiles <= 0:
+                    continue
+                _row = tile_bt_np[_b, :_n_tiles]
+                if (_row < 0).any():
+                    _neg = block_table_np[_b] < 0
+                    _alloc = int(_neg.argmax()) if _neg.any() else bt_cols
+                    _ima_bad.append(
+                        dict(
+                            b=_b,
+                            seq_len=int(_sl),
+                            query_len=query_lens_cpu[_b],
+                            tiles_needed=_n_tiles,
+                            allocated_blocks=_alloc,
+                            bad_tiles=int((_row < 0).sum()),
+                        )
+                        )
+            if _ima_bad:
+                logger.warning(
+                    "KVarN-IMA-TILE seq_len runs ahead of allocated blocks: %s",
+                    _ima_bad,
+                )
         bt_rows_cap = len(seq_lens_cpu)
         if (self._tile_bt_buf is None
                 or self._tile_bt_buf.shape[0] < bt_rows_cap):

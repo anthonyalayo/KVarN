@@ -313,6 +313,7 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_KVARN_IMA_DEBUG: bool = False
 
 
 def get_default_cache_root():
@@ -1159,6 +1160,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
     ),
+    # KVarN IMA diagnostics (default off): when enabled, emit
+    # KVarN-IMA-TILE / KVarN-IMA-COMP / KVarN-IMA-MAMBA records that pin the
+    # CPU-side trigger conditions for illegal-memory-access crashes on the
+    # KVarN hybrid attention path (seq_len running ahead of allocated blocks,
+    # computed-token bookkeeping divergence, mamba state-block indices).
+    "VLLM_KVARN_IMA_DEBUG": lambda: bool(int(os.getenv("VLLM_KVARN_IMA_DEBUG", "0"))),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
     # VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.

@@ -7,6 +7,8 @@ from typing import Any, NamedTuple
 
 import torch
 
+import vllm.envs as envs
+
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -1323,6 +1325,50 @@ def preprocess_mamba_all_specdec(
     prev_last_scheduled_idx_buf.copy_to_gpu()
 
 
+def _kvarn_ima_check_mamba_indices(
+    *,
+    req_ids: list[str],
+    num_accepted_tokens_gpu: torch.Tensor,
+    state_idx_np: "np.ndarray",
+    scheduled_np: "np.ndarray",
+    computed_np: "np.ndarray",
+    draft_np: "np.ndarray",
+    block_size: int,
+    max_blocks: int,
+) -> None:
+    """KVarN-IMA diagnostics (VLLM_KVARN_IMA_DEBUG, default off): CPU re-check
+    of the state-block indices the fused mamba postprocess kernel is about
+    to use. Mirrors the decision math of postprocess_mamba_fused_kernel
+    (running state -> aligned new computed -> dest block) from the same
+    staged inputs the kernel reads, so an out-of-range index is logged
+    before the kernel can write OOB."""
+    accepted = num_accepted_tokens_gpu[: len(req_ids)].tolist()
+    bad = []
+    for i, req_id in enumerate(req_ids):
+        src = int(state_idx_np[i])
+        running_state = (
+            int(computed_np[i]) + int(scheduled_np[i]) - int(draft_np[i])
+        )
+        new_computed = running_state + int(accepted[i]) - 1
+        aligned = (new_computed // block_size) * block_size
+        if aligned < running_state:
+            continue  # kernel updates no state block for this request
+        dest = aligned // block_size - 1
+        if not (0 <= src < max_blocks and 0 <= dest < max_blocks):
+            bad.append(
+                dict(
+                    req=req_id,
+                    prev=src,
+                    curr=dest,
+                    num_accepted=int(accepted[i]),
+                    block_size=block_size,
+                )
+            )
+    if bad:
+        logger.warning(
+            "KVarN-IMA-MAMBA state-block index out of range: %s", bad
+        )
+
 def postprocess_mamba_align_gpu(
     *,
     bufs: "MambaBuffers",
@@ -1361,6 +1407,20 @@ def postprocess_mamba_align_gpu(
             ],
         )
 
+    if envs.VLLM_KVARN_IMA_DEBUG:
+        _, mamba_spec = get_mamba_groups(kv_cache_config)
+        _kvarn_ima_check_mamba_indices(
+            req_ids=input_batch.req_ids[:num_reqs],
+            num_accepted_tokens_gpu=num_accepted_tokens_gpu,
+            state_idx_np=ctx.mamba_state_idx_buf.np,
+            scheduled_np=ctx.num_scheduled_tokens_buf.np,
+            computed_np=ctx.num_computed_tokens_buf.np,
+            draft_np=ctx.num_draft_tokens_buf.np,
+            block_size=mamba_spec.block_size,
+            max_blocks=input_batch.block_table[
+                ctx.mamba_group_ids[0]
+            ].max_num_blocks_per_req,
+        )
     ctx.run_fused_postprocess(
         num_reqs=num_reqs,
         num_accepted_tokens_gpu=num_accepted_tokens_gpu,
