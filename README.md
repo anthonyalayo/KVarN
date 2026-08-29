@@ -60,19 +60,24 @@ vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
 
 What's different from upstream KVarN:
 
-- kvarn_ dtypes map to dedicated KVARN_* KVQuantMode members, and the
-  packed per-(token, head) slot is published through 0.28's backend
-  customize_spec hook (AttentionSpec.state_content_bytes) — 0.28 removed
-  the TQ*Spec packed classes the v0.27.1 build reused.
-- hybrid (GDN/mamba) models: block-size + page alignment now come from
-  KVarN's packed page (the old plain-attention formula doubled the mamba
-  page and crashed initialize_kv_cache with MTP on), and the metadata
-  builder tracks pool slots / sinks / flushes in tile units (hybrid blocks
-  are 25 x 128 tiles; the old block-id keying did OOB block-table reads
-  and garbage KV).
-- DEV_NOTES.md: the stale flashinfer-cubin reinstall after base bumps.
+- Rebased onto vLLM 0.28.0 (upstream KVarN targets 0.23.0). The kvarn_ KV
+  dtypes are rewired into 0.28's KV-cache plumbing: each dtype gets its own
+  KVQuantMode, and the backend reports the packed slot size through 0.28's
+  customize_spec hook (0.28 dropped the packed-spec classes the 0.27 build
+  had been reusing).
+- Hybrid (GDN/mamba) models now work with MTP: block and page sizes come from
+  KVarN's packed layout instead of the plain-attention formula (which sized
+  the mamba page wrong and crashed at boot), and the attention metadata is
+  tracked in KVarN tiles (25x128 tokens per hybrid block) instead of raw
+  block ids (which read out of bounds and produced garbage KV).
+- MTP spec-decode verify: each KV block is dequantized once for all draft
+  tokens (the shared-dequant kernel) instead of once per token, which cuts
+  verify KV reads ~3x at long context. ON by default; set
+  KVARN_SHARED_VERIFY=0 to revert (perf table below).
+- DEV_NOTES.md: how to reinstall the flashinfer cubin after a base bump (the
+  cached one goes stale).
 
-dense + MLA + spec decode are unchanged from upstream.
+dense and MLA attention are otherwise unchanged from upstream.
 
 **Speculative decode profiling with "vllm bench serve --port 8000"**
 
