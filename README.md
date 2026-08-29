@@ -95,16 +95,19 @@ All experiments with flavors of the above quick-serve commands, but at 0.95 gpu 
 | 262K concurrency | 2.19× | 1.78× | 1.72× | 1.67× | — |
 | Acceptance (len) | — | 58.1% (1.58) | 46.5% (1.93) | 37.2% (2.11) | 0.6% (1.04) |
 
-**Winner: MTP+2** — 98% of MTP+3's throughput with 2.5pp less KV loss (1.72×
-vs 1.67× 262K concurrency) and the best ITL of the spec configs. MTP+3 only
-wins on raw tok/s, at the worst KV cap and worst ITL. DFlash2 is a no-go on
-this workload: 0.6% acceptance (the W4A16 drafter basically never accepts) →
-33% slower than no-MTP.
+**Winner: MTP+2.** It gets 98% of MTP+3's speed while keeping more KV cache
+free (1.72x vs 1.67x concurrency at 262K), and it has the best inter-token
+latency of the speculative configs. MTP+3 is only faster on raw throughput,
+and it does so with the smallest KV cache and the worst latency. DFlash2 does
+not work here: its W4A16 draft model gets accepted only 0.6% of the time, so
+it ends up 33% slower than running with no speculative decoding.
 
-**Shared-dequant MTP verify (default-ON):** the MTP verify pass dequants each
-KV block once for all draft tokens instead of once per token, so KV traffic
-drops to single-token decode. c1 verify microbench, one process, no
-acceptance confound:
+**Shared-dequant MTP verify (on by default):** when MTP checks its draft
+tokens it normally re-reads the KV cache once per draft token. The
+shared-dequant kernel reads each KV block once and reuses it for all the draft
+tokens, so the verify step does about a third of the KV reads. Measured on a
+single-process microbench (one request, no speculative-decoding acceptance
+noise):
 
 | ctx | shared (ms) | per-token (ms) | Δ |
 | --- | --- | --- | --- |
@@ -113,8 +116,8 @@ acceptance confound:
 | 64K | 0.241 | 0.378 | **−36%** |
 | 128K | 0.536 | 0.817 | **−34%** |
 
-Faster at every context; the saving grows with context. `KVARN_SHARED_VERIFY=0`
-reverts to the per-token path.
+The shared path is faster at every context, and the gap grows as the context
+gets longer. Set `KVARN_SHARED_VERIFY=0` to go back to the per-token path.
 
 ---
 
