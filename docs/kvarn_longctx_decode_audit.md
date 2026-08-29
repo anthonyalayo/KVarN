@@ -335,7 +335,7 @@ GPU; `g3` arg re-runs only the perf round). Unit A/B:
 |G0|pre-commit + import, no new violations vs baseline|PASS (2026-08-29)|
 |G1|Unit A/B: shared vs per-token on identical synthetic int4 + tail-pool state, seeded; 6 cases incl. the deployment geometry (144/24 heads, QLEN=3), the 64K x B=7 shape, the 8K floor, MTP+1/+3 shape classes, and the no-GQA dot floor; now covers the int4 path (G1 b2s fix above); PASS = finite + within fp32 noise|PASS — 6/6 (full gate run 2026-08-28)|
 |G2|**Single-process** serving A/B: one enforce_eager boot, two passes over 8 greedy prompts (8K/32K/131K) toggling `KVARN_SHARED_VERIFY=0/1`; the verify kernel is then the ONLY thing that differs (immune to the boot-to-boot non-determinism that invalidated the two-process version); PASS = 8/8 token-identical + MTP drafter up + no IMA/asserts|PASS — 8/8 token-identical (2026-08-28)|
-|G3|Perf: **single-process verify microbench** (`results/kvarn_audit/verify_microbench.py`) driving `kvarn_verify_attention` directly at c1 c131072/c8192, `KVARN_SHARED_VERIFY=0` vs default; PASS = shared <= per-token per-step latency. (The two-boot serving A/B was retired as a perf gate: its TPOT is confounded by boot-to-boot acceptance variance on random prompts, not KV traffic)|PASS — 131K shared 0.534 ms vs per-token 0.815 ms (**-0.281 ms, ~34% faster**); 8K 0.056 vs 0.069 ms (-0.012 ms, weight/GEMM-bound) (2026-08-28)|
+|G3|Perf: **single-process verify microbench** (`results/kvarn_audit/verify_microbench.py`) driving `kvarn_verify_attention` directly at c1 across 16K/32K/64K/128K **in one process** (fresh KV per context, freed between), `KVARN_SHARED_VERIFY=0` vs default; PASS = shared <= per-token per-step latency at every context. (The two-boot serving A/B was retired as a perf gate: its TPOT is confounded by boot-to-boot acceptance variance on random prompts, not KV traffic)|PASS — shared faster at every context (2026-08-29): 16K -0.062 ms (-47%), 32K -0.117 ms (-48%), 64K -0.137 ms (-36%), 128K -0.281 ms (-34%); absolute saving grows with context|
 
 **Why G2 changed from two boots to one process — and the outcome:** the first
 G2 run (two separate boots) diverged on 2/8 prompts, one to a wrong answer
@@ -349,16 +349,28 @@ divergence was boot non-determinism (draft-model + autotune + graph-pool
 state), not the shared-dequant math.
 
 G2's token identity is the correctness gate. G3 (single-process verify
-microbench) confirms the perf win at the kernel level: at 131K the shared
-path saves 0.281 ms per verify step (0.534 vs 0.815 ms, ~34% faster, the
-3x->1x KV-read model); at 8K the saving is 0.012 ms (the short-context step
-is weight/GEMM-bound, not KV-bound). The two-boot serving A/B cannot measure
-this workload: on random prompts the MTP acceptance rate is a noisy,
-window-dependent quantity (the off boot's aggregate was inflated by a 65.5%
-window and the on boot's deflated by near-zero windows), so its TPOT gap was
-an acceptance artifact, not a KV-traffic regression. The microbench is the
-valid perf gate; a serving-level TPOT measurement remains a separate,
-greedy-pinned follow-up if one is wanted.
+microbench) confirms the perf win at the kernel level across the context
+sweep - one process, fresh KV per context, no MTP, so acceptance variance is
+impossible by construction:
+
+    ctx   shared  pertok  delta    delta%
+   16K   0.069   0.131   -0.062   -47%
+   32K   0.128   0.245   -0.117   -48%
+   64K   0.241   0.378   -0.137   -36%
+  128K   0.536   0.817   -0.281   -34%
+
+The shared path is faster at every context (-34% to -48% on the verify
+attention step), and the absolute saving grows with context (0.062 ->
+0.281 ms) - the 3x->1x KV-read model. The two-boot serving matrix
+(16K/32K/64K/128K) is NOT a clean perf gate: on random prompts the MTP
+acceptance rate is a noisy, window-dependent quantity (it swung 1.68-2.09
+within a single arm, and the two arms disagreed at 32K/64K), so its TPOT gap
+was an acceptance artifact - except at 128K, where acceptance was ~equal
+(1.73 vs 1.71) and the flag showed its real end-to-end effect (-3.27 ms/
+token, 34% faster). The microbench is the valid perf gate; the 128K serving
+row is the realized end-to-end TPOT, and together they tell the full story
+(clean mechanism + end-to-end recovery, the latter capped by the weight/GEMM
+floor).
 
 ### Remaining known issues (unchanged by this fix)
 

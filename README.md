@@ -96,6 +96,21 @@ wins on raw tok/s, at the worst KV cap and worst ITL. DFlash2 is a no-go on
 this workload: 0.6% acceptance (the W4A16 drafter basically never accepts) →
 33% slower than no-MTP.
 
+**Shared-dequant MTP verify (default-ON):** the MTP verify pass dequants each
+KV block once for all draft tokens instead of once per token, so KV traffic
+drops to single-token decode. c1 verify microbench, one process, no
+acceptance confound:
+
+| ctx | shared (ms) | per-token (ms) | Δ |
+| --- | --- | --- | --- |
+| 16K | 0.069 | 0.131 | **−47%** |
+| 32K | 0.128 | 0.245 | **−48%** |
+| 64K | 0.241 | 0.378 | **−36%** |
+| 128K | 0.536 | 0.817 | **−34%** |
+
+Faster at every context; the saving grows with context. `KVARN_SHARED_VERIFY=0`
+reverts to the per-token path.
+
 ---
 
 <p align="center">
