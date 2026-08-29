@@ -1060,18 +1060,13 @@ def kvarn_verify_attention(
 
     out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
 
-    _m = qlen * (1 << ((Hq // Hk) - 1).bit_length() if Hq // Hk > 1 else 1)
+    _m = qlen * _qpk_pad
+    _m_pad = 1 << max(4, (_m - 1).bit_length())  # Q-tile rows: pow2, >= tl.dot min
     if (qlen >= 2 and seq_lens is not None and NQ % qlen == 0
-            and (_m & (_m - 1)) == 0          # Q-tile rows must be a power of 2
-            # DEFAULT OFF: numerically validated in isolation (matches the
-            # per-token kernel within fp32 reduction noise on live inputs,
-            # incl. on the failing trajectory), but serving with it corrupts
-            # the MTP drafter's proposals (invalid [-1,...] spec tokens,
-            # embedding index asserts at temperature>0, degenerate greedy
-            # output) through a mechanism not yet isolated — suspicion is an
-            # interaction with async scheduling / drafter metadata rather
-            # than kernel math. Re-enable for debugging only.
-            and os.environ.get("KVARN_SHARED_VERIFY", "0") == "1"):
+            # Shared-dequant verify: default ON; validated token-identical to the
+            # per-token path in serving (scripts_kvarn_dense/run_shared_verify_ab.sh).
+            # KVARN_SHARED_VERIFY=0 reverts to the per-token fallback.
+            and os.environ.get("KVARN_SHARED_VERIFY", "1") == "1"):
         # SHARED-DEQUANT uniform path: split-K shaped (SPLITS=1 degenerates
         # cleanly); stage2 combines into the flat [NQ*Hq, D] output.
         B = NQ // qlen
@@ -1095,7 +1090,7 @@ def kvarn_verify_attention(
             impl._tail_K_pool.stride(0), impl._tail_K_pool.stride(1),
             impl._tail_K_pool.stride(2),
             mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
-            QLEN=qlen, HQ=Hq, NUM_KV_SPLITS=SPLITS, **common,
+            QLEN=qlen, Q_TILE_ROWS=_m_pad, HQ=Hq, NUM_KV_SPLITS=SPLITS, **common,
         )
         out_flat = out_rot.view(Nrows, D)
         _kvarn_fused_decode_stage2[(Nrows,)](
@@ -1165,8 +1160,9 @@ def kvarn_verify_attention(
 # SHARED-DEQUANT verify kernel: one program per (REQUEST, kv-head, split) — all
 # QLEN verify tokens of a request share each block's dequant (the per-token
 # VQ_INDIRECT path above re-walks the context once per token, i.e. QLEN
-# redundant dequants). Q tile is [QLEN * Q_PER_KV_PAD, D] with a per-row
-# bottom-right causal limit: row (token j, lane h) attends kv positions
+# redundant dequants). The Q tile is padded to Q_TILE_ROWS rows (a power of
+# 2, >= 16); rows with j >= QLEN are masked out. Each row (token j, lane h)
+# carries a bottom-right causal limit: it attends kv positions
 # < seq_len - QLEN + j + 1. Uniform QLEN is a constexpr (uniform-batch graph
 # capture guarantees it); non-uniform eager batches fall back to the per-token
 # kernel. Scale vectors are loaded via fp16 pointer casts (the tile offsets are
@@ -1201,6 +1197,7 @@ def _kvarn_fused_verify_stage1(
     MAX_BLOCKS_PER_REQ: tl.constexpr,  # unused; kept for launch-dict parity
     D: tl.constexpr, GROUP: tl.constexpr, BLOCK_N: tl.constexpr,
     QLEN: tl.constexpr, Q_PER_KV: tl.constexpr, Q_PER_KV_PAD: tl.constexpr,
+    Q_TILE_ROWS: tl.constexpr,
     HQ: tl.constexpr, NUM_KV_SPLITS: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     K_BITS: tl.constexpr, V_BITS: tl.constexpr,
@@ -1219,12 +1216,11 @@ def _kvarn_fused_verify_stage1(
     if seq_len <= 0:
         return
 
-    M: tl.constexpr = QLEN * Q_PER_KV_PAD
-    r = tl.arange(0, M)
+    r = tl.arange(0, Q_TILE_ROWS)
     j = r // Q_PER_KV_PAD                                  # token idx in request
     lane = r % Q_PER_KV_PAD                                # query-head lane
-    rmask = lane < Q_PER_KV
-    limit = seq_len - QLEN + j + 1                         # [M] causal kv limit
+    rmask = (lane < Q_PER_KV) & (j < QLEN)
+    limit = seq_len - QLEN + j + 1                         # causal kv limit
     hq0 = hk * Q_PER_KV
     d_offs = tl.arange(0, D)
 
@@ -1235,14 +1231,14 @@ def _kvarn_fused_verify_stage1(
     d_byte_v = d_offs // PACK_V
     d_shift_v = (d_offs % PACK_V) * V_BITS
 
-    tok_row = b * QLEN + j                                 # [M] token-major Q row
+    tok_row = b * QLEN + j                                 # token-major Q row
     q = tl.load(Q_ptr + tok_row[:, None] * stride_q_t
                 + (hq0 + lane)[:, None] * stride_q_h + d_offs[None, :],
-                mask=rmask[:, None], other=0.0).to(tl.float32)   # [M, D]
+                mask=rmask[:, None], other=0.0).to(tl.float32)  # [Q_TILE_ROWS, D]
 
-    m_i = tl.full([M], -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([M], dtype=tl.float32)
-    acc = tl.zeros([M, D], dtype=tl.float32)
+    m_i = tl.full([Q_TILE_ROWS], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([Q_TILE_ROWS], dtype=tl.float32)
+    acc = tl.zeros([Q_TILE_ROWS, D], dtype=tl.float32)
 
     n_blocks = (seq_len + GROUP - 1) // GROUP
     blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
@@ -1304,7 +1300,7 @@ def _kvarn_fused_verify_stage1(
                 q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
                 Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
 
-            scores = tl.dot(q, K_dg)                              # [M, BN]
+            scores = tl.dot(q, K_dg)                       # [Q_TILE_ROWS, BN]
             smask = cmask[None, :] & (kvpos[None, :] < limit[:, None])
             if SLIDING_WINDOW > 0:
                 smask = smask & (kvpos[None, :]
@@ -1321,7 +1317,7 @@ def _kvarn_fused_verify_stage1(
     O_s = acc / tl.where(nonempty, l_i, 1.0)[:, None]
     lse_s = tl.where(nonempty,
                      m_i + tl.log(tl.where(nonempty, l_i, 1.0)), -float("inf"))
-    rows = tok_row * HQ + hq0 + lane                              # [M] N-row index
+    rows = tok_row * HQ + hq0 + lane                       # N-row index
     tl.store(MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s
              + d_offs[None, :], O_s, mask=rmask[:, None])
     tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s, mask=rmask)
