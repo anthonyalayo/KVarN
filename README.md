@@ -116,8 +116,42 @@ noise):
 | 64K | 0.241 | 0.378 | **−36%** |
 | 128K | 0.536 | 0.817 | **−34%** |
 
-The shared path is faster at every context, and the gap grows as the context
-gets longer. Set `KVARN_SHARED_VERIFY=0` to go back to the per-token path.
+The same comparison end-to-end in serving (MTP+2, `vllm bench serve`, random
+prompts, 128 output tokens, c1, same seed for both boots):
+
+| ctx | TPOT shared (ms) | TPOT per-token (ms) | Δ (ms/token) |
+| --- | --- | --- | --- |
+| 16K | 10.46 | 11.02 | **−0.56** |
+| 32K | 11.26 | 12.63 | **−1.37** |
+| 64K | 11.56 | 14.11 | **−2.56** |
+| 131K | 14.01 | 16.99 | **−2.98** |
+
+TPOT is the signal: two separate boots are not bit-reproducible (fp4 autotune
+cache and graph-pool state differ per boot), so draft acceptance wanders a
+little per boot (whole-run mean acceptance length 1.95 vs 1.82) and the
+wall-clock throughput rows are confounded by prefill — but the decode step is
+cheaper with the shared path at every context, and the gap grows with context,
+exactly as the microbench predicts.
+
+The shared path is faster at every context in both the microbench and serving,
+and the gap grows as the context gets longer. Set `KVARN_SHARED_VERIFY=0` to go
+back to the per-token path.
+
+**Context sweep (MTP+2, the quick-serve config above)** — `ctx_sweep.sh`,
+random prompts, 128 output tokens, the pinned `--kv-cache-memory` budget:
+
+| ctx | c1 TPOT (ms) | c4 TPOT (ms) | c1 out tok/s | c4 out tok/s |
+| --- | --- | --- | --- | --- |
+| 8K | 10.24 | 25.75 | 63.3 | 116.5 |
+| 32K | 10.99 | 91.5 | 21.5 | 27.7 |
+| 131K | 13.69 | 247.6 | 3.23 | 3.72 |
+| 245K | 17.19* | — | 1.12 | — |
+
+Caveats: a few 245K prompts exceed `max_model_len` (tokenizer warning
+265238 > 262144), so read that row as indicative; 245K c4 is infeasible at
+this capacity (4 × 245.8K ≈ 983K tokens vs the ~490K-token KV pool — OOM, all
+requests failed); c4 from 32K up hits the known untuned fp4-GEMM fallback
+cliff at verify-batch shapes (separate issue, not the KV path).
 
 ---
 
