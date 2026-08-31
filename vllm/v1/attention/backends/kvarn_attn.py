@@ -508,12 +508,39 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             cam, decode_threshold=self.reorder_batch_threshold
         )
+        # KVarN-IMA-BUILD diagnostic (VLLM_KVARN_IMA_DEBUG, default off):
+        # capture the framework's cached CPU copy BEFORE anything lazily
+        # fills it — the deprecated cam.seq_lens_cpu property caches its own
+        # D2H into _seq_lens_cpu on first access, which would otherwise be
+        # indistinguishable from a runner-set CPU copy. The record emitted
+        # below shows what THIS build actually consumes next to the
+        # authoritative GPU seq_lens, so a log can directly tell whether the
+        # consumed lengths track the GPU-corrected values or a stale
+        # optimistic shadow (async spec decode).
+        _ima_slc_field = getattr(cam, "_seq_lens_cpu", None)
+        _ima_capturing = torch.cuda.is_current_stream_capturing()
         # Pre-materialise CPU views ONCE per batch. Every layer's forward()
         # would otherwise re-issue these syncs (28+ syncs/token for Qwen3-0.6B).
-        # Use the framework's cached CPU copy of seq_lens (cam.seq_lens_cpu) to
-        # avoid an extra GPU->CPU sync per step (issue #15 build-overhead).
-        _slc = getattr(cam, "seq_lens_cpu", None)
-        seq_lens_cpu = _slc.tolist() if _slc is not None else cam.seq_lens.tolist()
+        #
+        # The tile lifecycle (which tail tiles get permanently quantized to
+        # int4, and how long each verify query's causal window is) must be
+        # driven by the AUTHORITATIVE GPU seq_lens: the framework's cached
+        # CPU copy (cam.seq_lens_cpu) is an optimistic shadow under spec
+        # decode — after a rejection step it runs the previous step's
+        # rejection count (<= num_speculative_tokens) ahead of the true
+        # committed length, at exactly the moment these decisions are made.
+        # The one D2H is the price of correctness (async spec decode already
+        # paid one via the deprecated property path; sync spec decode pays
+        # one extra).
+        if torch.cuda.is_current_stream_capturing():
+            # Graph-capture pass: a D2H sync is illegal here. The capture
+            # run is a dummy pass — only the request count matters for the
+            # buffers derived below — so use the runner-set CPU field and,
+            # absent that, unit lengths.
+            _slc = getattr(cam, "_seq_lens_cpu", None)
+            seq_lens_cpu = _slc.tolist() if _slc is not None else [1] * cam.num_reqs
+        else:
+            seq_lens_cpu = cam.seq_lens.tolist()
         # Per-request query length this step (already on CPU; no extra sync).
         # query_len > 1 for prefill chunks and for speculative-decode verify
         # steps (MTP / draft). Used by flush detection to compute the COMMITTED
@@ -525,6 +552,19 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             query_lens_cpu = [_qsl_l[i + 1] - _qsl_l[i] for i in range(len(_qsl_l) - 1)]
         else:
             query_lens_cpu = [1] * len(seq_lens_cpu)
+        if envs.VLLM_KVARN_IMA_DEBUG:
+            _n = min(8, cam.num_reqs)
+            logger.warning(
+                "KVarN-IMA-BUILD consuming=%s gpu=%s cpu_field=%s q=%s capturing=%s",
+                seq_lens_cpu[:_n],
+                # D2H is illegal on the capture pass itself — the capture
+                # run is a dummy pass anyway; the eager-step records carry
+                # the real GPU values.
+                None if _ima_capturing else cam.seq_lens[:_n].tolist(),
+                _ima_slc_field[:_n].tolist() if _ima_slc_field is not None else None,
+                query_lens_cpu[:_n],
+                _ima_capturing,
+            )
         # block_table as a numpy 2-D array (C-backed, lazy element access) rather
         # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
         # at B=256 and dominated build() once the flush was vectorized (issue #15).
@@ -957,10 +997,12 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 if ql != uniform:
                     uniform = 0
                 committed = max(seq_lens_cpu[b] - ql, 0)
-                full = committed + ql
+                flat_limit = committed + ql
                 for j in range(ql):
                     vq_req_host[vq_idx] = b
-                    vq_seqlen_host[vq_idx] = full if non_causal else committed + j + 1
+                    vq_seqlen_host[vq_idx] = (
+                        flat_limit if non_causal else committed + j + 1
+                    )
                     vq_idx += 1
             # Uniform query length -> the shared-dequant verify kernel (the
             # request's tokens share each block's dequant); this is always the
