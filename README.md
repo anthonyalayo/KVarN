@@ -28,9 +28,9 @@ vllm serve <args>
 **My Quick Serve (for RTX 5090 32GB VRAM):**
 
 ```bash
-# WINNER: MTP+2 — 303.9 out tok/s (1.27× no-MTP), 1.72× 262K concurrency
+# WINNER: MTP+2 — 310.9 out tok/s (1.28× no-MTP), 1.82× 262K concurrency
 # GPU KV cache size: 476,878 tokens, Maximum concurrency for 262,144 tokens per request: 1.82x
-vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
+vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090-LMHead4 \
     --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
     --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
     --kv-cache-memory 9551856271 \
@@ -38,16 +38,16 @@ vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
 
-# baseline: no MTP — 240.1 out tok/s, 2.19× 262K concurrency
-vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
+# baseline: no MTP — 243.5 out tok/s, 2.07× 262K concurrency
+vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090-LMHead4 \
     --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
     --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
-    --gpu-memory-utilization 0.95 \
+    --kv-cache-memory 9551856271 \
     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --limit-mm-per-prompt '{"image": 4}' --mm-processor-kwargs '{"max_pixels": 8388608}'
 
 # DFlash2 — 160.6 out tok/s, 0.6% acceptance; kept for reference, do not use
-vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
+vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090-LMHead4 \
     --quantization modelopt --chat-template ~/qwen38-froggeric-v22.jinja \
     --kv-cache-dtype kvarn_k4v2_g128 --max-model-len auto --max-num-seqs 4 \
     --gpu-memory-utilization 0.95 \
@@ -57,6 +57,11 @@ vllm serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
 ```
 
 **Note: `--kv-cache-memory 9551856271` gets a gpu util between 0.95 and 0.96 on the MTP+2 case.**
+
+**Model note:** use the `-LMHead4` repo. The plain `-RTX5090` repo was
+re-pushed and its current snapshot ships no MTP head tensors (and
+`--revision` did not pin the old snapshot); the server boots fine on it,
+but MTP acceptance is 0.0%.
 
 What's different from upstream KVarN:
 
@@ -81,26 +86,29 @@ dense and MLA attention are otherwise unchanged from upstream.
 
 **Speculative decode profiling with "vllm bench serve --port 8000"**
 
-All experiments with flavors of the above quick-serve commands, but at 0.95 gpu util (so context window can be even higher than listed).
+All experiments with the above quick-serve commands on the LMHead4 model
+(`--kv-cache-memory 9551856271` ≈ 0.95 gpu util), 1000 requests at
+1024 input / 128 output tokens each.
 
 | | No MTP | MTP+1 | MTP+2 | MTP+3 | DFlash2 (7) |
 | --- | --- | --- | --- | --- | --- |
-| Output tok/s | 240.1 | 293.8 | 303.9 | **309.0** | 160.6 |
-| Total tok/s | 2160.7 | 2644.6 | 2735.2 | **2780.6** | 1445.4 |
-| vs no MTP | 1.00× | 1.22× | 1.27× | **1.29×** | 0.67× |
-| Mean TPOT (ms) | 15.76 | 12.67 | 12.13 | **11.91** | 23.35 |
-| Median ITL (ms) | **14.46** | 16.80 | 19.35 | 20.61 | 21.47 |
-| P99 ITL (ms) | **71.5** | 90.0 | 94.8 | 96.9 | 95.0 |
-| KV cache (tokens) | 574,929 | 466,673 | 451,780 | 437,807 | — |
-| 262K concurrency | 2.19× | 1.78× | 1.72× | 1.67× | — |
-| Acceptance (len) | — | 58.1% (1.58) | 46.5% (1.93) | 37.2% (2.11) | 0.6% (1.04) |
+| Output tok/s | 243.5 | 296.0 | 310.9 | **316.3** | 160.6 |
+| Total tok/s | 2191.5 | 2663.7 | 2797.9 | **2846.5** | 1445.4 |
+| vs no MTP | 1.00× | 1.22× | 1.28× | **1.30×** | 0.66× |
+| Mean TPOT (ms) | 15.52 | 12.60 | 11.88 | **11.58** | 23.35 |
+| Median ITL (ms) | **14.22** | 16.86 | 18.97 | 20.05 | 21.47 |
+| P99 ITL (ms) | **72.91** | 89.45 | 93.52 | 95.55 | 95.0 |
+| KV cache (tokens) | 542,161 | 492,600 | 476,878 | 462,130 | — |
+| 262K concurrency | 2.07× | 1.88× | 1.82× | 1.76× | — |
+| Acceptance (len) | — | 59.7% (1.60) | 46.6% (1.93) | 37.2% (2.12) | 0.6% (1.04) |
 
-**Winner: MTP+2.** It gets 98% of MTP+3's speed while keeping more KV cache
-free (1.72x vs 1.67x concurrency at 262K), and it has the best inter-token
-latency of the speculative configs. MTP+3 is only faster on raw throughput,
-and it does so with the smallest KV cache and the worst latency. DFlash2 does
-not work here: its W4A16 draft model gets accepted only 0.6% of the time, so
-it ends up 33% slower than running with no speculative decoding.
+**Winner: MTP+2.** It gets 98% of MTP+3's speed (310.9 vs 316.3 tok/s)
+while keeping more KV cache free (1.82x vs 1.76x concurrency at 262K) and
+lower inter-token latency (18.97 vs 20.05 median ITL). MTP+3 is only
+faster on raw throughput, and it does so with the smallest KV cache and
+the worst latency. DFlash2 does not work here: its W4A16 draft model gets
+accepted only 0.6% of the time, so it ends up 34% slower than running
+with no speculative decoding.
 
 **Shared-dequant MTP verify (on by default):** when MTP checks its draft
 tokens it normally re-reads the KV cache once per draft token. The
