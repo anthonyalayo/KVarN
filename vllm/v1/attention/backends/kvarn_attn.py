@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import math
 import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -377,6 +378,25 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         kv_cache_group_id: int | None = None,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # KVarN-IMA-IDENT (VLLM_KVARN_IMA_DEBUG, default off): self-ID the
+        # running code — tree path + git HEAD of the editable checkout.
+        # After a `git checkout` there is no rebuild: the server log states
+        # exactly which commit produced this run.
+        if os.environ.get("VLLM_KVARN_IMA_DEBUG", "0") == "1":
+            try:
+                _repo = os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__))))))
+                _head = subprocess.run(
+                    ["git", "-C", _repo, "log", "-1", "--format=%h %s"],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout.strip() or "n/a"
+            except (OSError, subprocess.SubprocessError):
+                _repo, _head = os.path.abspath(__file__), "n/a"
+            logger.warning(
+                "KVarN-IDENT tree=%s git=%s pid=%d",
+                _repo, _head, os.getpid(),
+            )
         # spec-as-decode: verify steps (query_len <= 1 + num_spec) classify
         # as decodes and carry a vq plan (see build()) for the fused verify
         # kernel; the threshold is derived from speculative_config by the
