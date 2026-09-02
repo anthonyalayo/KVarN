@@ -674,6 +674,10 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     supports_update_block_table: bool = False
     # Whether the builder constructor requires the block-table width.
     requires_block_table_width: ClassVar[bool] = False
+    # Opt-in: builder ctor receives `kv_cache_group_id` so backends with
+    # per-kv-cache-group state (e.g. KVarN) key it by the group id instead
+    # of their layer set.
+    requires_kv_cache_group_id: ClassVar[bool] = False
     # Whether all step-dependent draft decode metadata can be updated in place,
     # allowing one metadata build to be reused across autoregressive draft steps.
     supports_draft_decode_metadata_update: bool = False

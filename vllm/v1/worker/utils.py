@@ -271,6 +271,8 @@ class AttentionGroup:
             builder_kwargs["block_table_width"] = get_block_table_width(
                 max_num_blocks, self.kv_cache_spec.block_size, kernel_block_size
             )
+        if builder_cls.requires_kv_cache_group_id:
+            builder_kwargs["kv_cache_group_id"] = self.kv_cache_group_id
         self.metadata_builders = [
             builder_cls(
                 kv_cache_spec_builder,

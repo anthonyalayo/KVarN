@@ -335,6 +335,15 @@ class KVarNMetadata(AttentionMetadata):
     causal: bool = True
 
 
+# KVARN_MTP_FIX A/B switch for the MTP split-brain fix (microbenchmarking):
+#   off   = HEAD behavior: per-builder group key, per-instance fill/retired,
+#           ungated draft lifecycle, per-builder flush pairing
+#   unify = Step 1 only: unified ("kvarn-kvgroup", gid) key + shared
+#           per-group fill/retired; lifecycle still ungated
+#   full  = Steps 1-3 (default): + fast_build gating + group-wide pairing
+_MTP_FIX = os.environ.get("KVARN_MTP_FIX", "full").lower()
+
+
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     """Builds ``KVarNMetadata`` from scheduler output."""
 
@@ -354,7 +363,19 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
 
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+    # Ctor receives `kv_cache_group_id` (plumbed by
+    # AttentionGroup.create_metadata_builders) so the engine + MTP draft
+    # builders of one kv-cache group share ONE slot allocator (see __init__).
+    requires_kv_cache_group_id = True
+
+    def __init__(
+        self,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        kv_cache_group_id: int | None = None,
+    ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # spec-as-decode: verify steps (query_len <= 1 + num_spec) classify
         # as decodes and carry a vq plan (see build()) for the fused verify
@@ -372,29 +393,56 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # multiple groups (Gemma-4's repeating pattern -> 5 sliding groups all
         # head256/16kv/1024), each with its own block_id space. The builder tags
         # its impls with this key in build() (impls don't reliably carry a name).
+        # When the runner plumbs `kv_cache_group_id`
+        # (requires_kv_cache_group_id), the key is
+        # `("kvarn-kvgroup", kv_cache_group_id)` so the draft builder shares
+        # the engine's allocator (MTP layers are members of the main model's
+        # group).
         self._layer_names = list(layer_names)
         self._layer_names_set = set(self._layer_names)
-        self._group_key = tuple(sorted(self._layer_names))
-        # Stage α-2: per-block fill tracking — block_id -> tokens present in
-        # the pool for that block after the current step. Keyed by PHYSICAL
-        # block (never by request or by the sink block id): vLLM's prefix
-        # caching shares physical blocks across live requests and recycles ids
-        # across finished ones, so any request-identity proxy collides under
-        # sharing (the issue #10 repetition-collapse / stale-tile class). A
-        # partial block has exactly one writer, so the value has a single
-        # source. Drives flush-on-reclaim: a finished request's complete block
-        # must be flushed (a future prefix-cache hit may read it), a partial
-        # one is safe to discard (vLLM never prefix-caches partial blocks).
-        self._block_fill: dict[int, int] = {}
-        # Retired sinks: finished requests' sink blocks, kept RESIDENT in the
-        # fp16 pool (insertion order = retirement order) instead of flushed on
-        # reclaim. A prefix-cache hit re-adopts the block with its fp16 data
-        # byte-identical — preserving KVarN's fp16-sink accuracy on multi-turn
-        # traffic, where every follow-up turn reuses the previous turn's first
-        # block. Evicted (flushed to int4, so later cache hits still find a
-        # valid tile) lazily, oldest first, only when slot allocation runs
-        # dry — residency therefore never shrinks live capacity.
-        self._retired_sinks: dict[int, None] = {}
+        if _MTP_FIX == "off":
+            # A/B mode: reproduce the pre-unification (HEAD) behavior —
+            # per-builder key, per-instance state; build() likewise skips
+            # the fast_build gates and the group-wide flush pairing.
+            self._group_key: tuple = tuple(sorted(self._layer_names))
+            self._block_fill: dict[int, int] = {}
+            self._retired_sinks: dict[int, None] = {}
+        else:
+            if kv_cache_group_id is not None:
+                # Production: engine + MTP draft builders of one kv-cache
+                # group share this key -> ONE slot allocator for the whole
+                # group's block space.
+                self._group_key = ("kvarn-kvgroup", kv_cache_group_id)
+            else:  # harness fallback (no group id plumbed)
+                self._group_key = tuple(sorted(self._layer_names))
+            # Stage α-2: per-block fill tracking — block_id -> tokens present
+            # in the pool for that block after the current step. Keyed by
+            # PHYSICAL block (never by request or by the sink block id):
+            # vLLM's prefix caching shares physical blocks across live
+            # requests and recycles ids across finished ones, so any
+            # request-identity proxy collides under sharing (the issue #10
+            # repetition-collapse / stale-tile class). A partial block has
+            # exactly one writer, so the value has a single source. Drives
+            # flush-on-reclaim: a finished request's complete block must be
+            # flushed (a future prefix-cache hit may read it), a partial one
+            # is safe to discard (vLLM never prefix-caches partial blocks).
+            self._block_fill = KVarNAttentionImpl._block_fill_per_group.setdefault(
+                self._group_key, {}
+            )
+            # Retired sinks: finished requests' sink blocks, kept RESIDENT in
+            # the fp16 pool (insertion order = retirement order) instead of
+            # flushed on reclaim. A prefix-cache hit re-adopts the block with
+            # its fp16 data byte-identical — preserving KVarN's fp16-sink
+            # accuracy on multi-turn traffic, where every follow-up turn
+            # reuses the previous turn's first block. Evicted (flushed to
+            # int4, so later cache hits still find a valid tile) lazily,
+            # oldest first, only when slot allocation runs dry — residency
+            # therefore never shrinks live capacity.
+            self._retired_sinks = (
+                KVarNAttentionImpl._retired_sinks_per_group.setdefault(
+                    self._group_key, {}
+                )
+            )
 
         # Max model length (for the fixed FA grid bound + max_blocks_per_req).
         try:
@@ -801,28 +849,34 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # below). Idempotent under prefix sharing: a co-owner finds the
             # tile already queued (or slotless) and stops — no per-request
             # state to collide.
+            # Engine-only: the draft cam is a per-step subset / stale shadow,
+            # so a tile that looks complete from its narrow view may not be;
+            # only the engine (full live batch) may queue flushes.
             flush_block_ids: list[int] = []
             flush_seen: set[int] = set()
-            for b in range(B):
-                if b >= bt_rows or bt_cols == 0:
-                    break
-                sl = seq_lens_cpu[b]
-                row = block_table_np[b]
-                if sl <= 0:
-                    continue
-                q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
-                committed_len = max(sl - q_len, 0)  # tokens already in pool & accepted
-                t = committed_len // GROUP - 1
-                while t >= 1:
-                    vbid = int(row[t // self._tpr])
-                    if vbid < 0:
+            if not (fast_build and _MTP_FIX == "full"):
+                for b in range(B):
+                    if b >= bt_rows or bt_cols == 0:
                         break
-                    tr = vbid * self._tpr + t % self._tpr
-                    if tr in flush_seen or tr in sinks or tr not in dict_map:
-                        break
-                    flush_seen.add(tr)
-                    flush_block_ids.append(tr)
-                    t -= 1
+                    sl = seq_lens_cpu[b]
+                    row = block_table_np[b]
+                    if sl <= 0:
+                        continue
+                    q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                    committed_len = max(
+                        sl - q_len, 0
+                    )  # tokens already in pool & accepted
+                    t = committed_len // GROUP - 1
+                    while t >= 1:
+                        vbid = int(row[t // self._tpr])
+                        if vbid < 0:
+                            break
+                        tr = vbid * self._tpr + t % self._tpr
+                        if tr in flush_seen or tr in sinks or tr not in dict_map:
+                            break
+                        flush_seen.add(tr)
+                        flush_block_ids.append(tr)
+                        t -= 1
 
             # (2b) Reclaim slot-holding tiles neither written this step nor
             # queued above: they belong to finished (or preempted) requests.
@@ -834,23 +888,30 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # hand it to a future request, which must find a valid int4 tile
             # (the old discard left stale tile bytes). A PARTIAL tile is
             # discarded: vLLM never prefix-caches partial blocks.
+            # Engine-only: the reclaim premise 'not in blocks_needed =>
+            # finished' holds only when blocks_needed covers the FULL live
+            # batch (engine cams); a draft cam covers only the speculative
+            # subset.
             discard_ids: list[int] = []
-            for bid in [
-                b for b in dict_map if b not in blocks_needed and b not in flush_seen
-            ]:
-                full = self._block_fill.get(bid, 0) >= GROUP
-                if full and bid in sinks:
-                    self._retired_sinks[bid] = None  # idempotent re-insert
-                    continue
-                if full:
-                    flush_seen.add(bid)
-                    flush_block_ids.append(bid)
-                else:
-                    discard_ids.append(bid)
-                if bid in sinks:  # finished request's partial sink
-                    sinks.discard(bid)
-                    if bid < is_sink_t.shape[0]:
-                        is_sink_t[bid] = False
+            if not (fast_build and _MTP_FIX == "full"):
+                for bid in [
+                    b
+                    for b in dict_map
+                    if b not in blocks_needed and b not in flush_seen
+                ]:
+                    full = self._block_fill.get(bid, 0) >= GROUP
+                    if full and bid in sinks:
+                        self._retired_sinks[bid] = None  # idempotent re-insert
+                        continue
+                    if full:
+                        flush_seen.add(bid)
+                        flush_block_ids.append(bid)
+                    else:
+                        discard_ids.append(bid)
+                    if bid in sinks:  # finished request's partial sink
+                        sinks.discard(bid)
+                        if bid < is_sink_t.shape[0]:
+                            is_sink_t[bid] = False
 
             # Trigger the flush on every layer's pool. Each impl quantises its
             # own pool[slot] into its own kv_cache (ref cached on first
@@ -860,8 +921,13 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 # One batched Sinkhorn + RTN over ALL (layer, block) flush tiles
                 # — replaces 48×N_blocks individual launches. Numerically
                 # identical (per-tile-independent ops) → no accuracy change.
+                impls = (
+                    KVarNAttentionImpl._impls_for_group(gk)
+                    if _MTP_FIX == "full"
+                    else group_impls
+                )
                 flush_pairs = []
-                for impl in group_impls:
+                for impl in impls:
                     kvc = getattr(impl, "_kv_cache_ref", None)
                     if kvc is None:
                         continue
@@ -897,7 +963,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                         self._retired_sinks.pop(old)
                         evict_pairs = [
                             (impl, old, impl._kv_cache_ref)
-                            for impl in group_impls
+                            for impl in (
+                                KVarNAttentionImpl._impls_for_group(gk)
+                                if _MTP_FIX == "full"
+                                else group_impls
+                            )
                             if getattr(impl, "_kv_cache_ref", None) is not None
                         ]
                         KVarNAttentionImpl._batched_flush(evict_pairs)
@@ -1129,6 +1199,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _block_to_slot_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
     _is_sink_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
     _max_known_block_id: ClassVar[dict[tuple, int]] = {}
+    # Per-group fill counts / retired sinks — class-level so the engine and
+    # the MTP draft builder of one group share them (builders hold per-group
+    # references set in KVarNMetadataBuilder.__init__).
+    _block_fill_per_group: ClassVar[dict[tuple, dict[int, int]]] = {}
+    _retired_sinks_per_group: ClassVar[dict[tuple, dict[int, None]]] = {}
     # Keys (device, D, group, k_bits, v_bits) whose flush kernels (Sinkhorn +
     # int4 store) have already been JIT-compiled via the pool-init warmup.
     _kernel_warmed: ClassVar[set] = set()
